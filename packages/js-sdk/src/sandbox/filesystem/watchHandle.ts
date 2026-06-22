@@ -1,8 +1,12 @@
-import { handleRpcError } from '../../envd/rpc'
+import {
+  handleRpcErrorWithHealthCheck,
+  SandboxHealthCheck,
+} from '../../envd/rpc'
 import {
   EventType,
   WatchDirResponse,
 } from '../../envd/filesystem/filesystem_pb'
+import { EntryInfo, mapEntryInfo } from './index'
 
 /**
  * Sandbox filesystem event types.
@@ -57,6 +61,14 @@ export interface FilesystemEvent {
    * Filesystem operation event type.
    */
   type: FilesystemEventType
+  /**
+   * Information about the entry that triggered the event.
+   *
+   * Only populated when the watch was started with `includeEntry: true` and the
+   * sandbox's envd version supports it. It may be `undefined` for events where the
+   * entry no longer exists at the path (e.g. remove or rename-away events).
+   */
+  entry?: EntryInfo
 }
 
 /**
@@ -69,7 +81,8 @@ export class WatchHandle {
     private readonly handleStop: () => void,
     private readonly events: AsyncIterable<WatchDirResponse>,
     private readonly onEvent?: (event: FilesystemEvent) => void | Promise<void>,
-    private readonly onExit?: (err?: Error) => void | Promise<void>
+    private readonly onExit?: (err?: Error) => void | Promise<void>,
+    private readonly checkHealth?: SandboxHealthCheck
   ) {
     this.handleEvents()
   }
@@ -91,7 +104,7 @@ export class WatchHandle {
         }
       }
     } catch (err) {
-      throw handleRpcError(err)
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
@@ -106,6 +119,9 @@ export class WatchHandle {
         this.onEvent?.({
           name: event.value.name,
           type: eventType,
+          entry: event.value.entry
+            ? mapEntryInfo(event.value.entry)
+            : undefined,
         })
       }
       this.onExit?.()

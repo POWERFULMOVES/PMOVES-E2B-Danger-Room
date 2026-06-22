@@ -9,13 +9,11 @@ import httpx
 from packaging.version import Version
 from typing_extensions import Self, Unpack
 
-from e2b.api.client.types import Unset
-from e2b.api.client_sync import get_envd_transport as get_transport
 from e2b.connection_config import ApiParams, ConnectionConfig
 from e2b.envd.api import ENVD_API_HEALTH_ROUTE, handle_envd_api_exception
 from e2b.envd.versions import ENVD_DEBUG_FALLBACK
 from e2b.exceptions import (
-    SandboxException,
+    TemplateException,
     format_request_timeout_error,
 )
 from e2b.sandbox.main import SandboxOpts
@@ -101,33 +99,26 @@ class Sandbox(SandboxApi):
         """
         super().__init__(**opts)
 
-        self._transport = get_transport(self.connection_config)
-
-        self._envd_api = httpx.Client(
-            base_url=self.envd_api_url,
-            transport=self._transport,
-            headers=self.connection_config.sandbox_headers,
-        )
         self._filesystem = Filesystem(
             self.envd_api_url,
             self._envd_version,
             self.connection_config,
-            self._transport.pool,
-            self._envd_api,
         )
         self._commands = Commands(
             self.envd_api_url,
             self.connection_config,
-            self._transport.pool,
             self._envd_version,
         )
         self._pty = Pty(
             self.envd_api_url,
             self.connection_config,
-            self._transport.pool,
             self._envd_version,
         )
         self._git = Git(self._commands)
+
+    @property
+    def _envd_api(self) -> httpx.Client:
+        return self._filesystem._envd_api
 
     def is_running(self, request_timeout: Optional[float] = None) -> bool:
         """
@@ -325,6 +316,10 @@ class Sandbox(SandboxApi):
         same_sandbox = sandbox.connect()
         ```
         """
+        if self.connection_config.debug:
+            # Skip connecting to the sandbox in debug mode
+            return self
+
         SandboxApi._cls_connect(
             sandbox_id=self.sandbox_id,
             timeout=timeout,
@@ -376,6 +371,10 @@ class Sandbox(SandboxApi):
 
         :return: `True` if the sandbox was killed, `False` if the sandbox was not found
         """
+        if self.connection_config.debug:
+            # Skip killing the sandbox in debug mode
+            return True
+
         return SandboxApi._cls_kill(
             sandbox_id=self.sandbox_id,
             **self.connection_config.get_api_params(**opts),
@@ -578,16 +577,20 @@ class Sandbox(SandboxApi):
         **opts: Unpack[ApiParams],
     ) -> List[SandboxMetrics]:
         """
-        Get the metrics of the sandbox specified by sandbox ID.
+        Get the metrics of the current sandbox.
 
         :param start: Start time for the metrics, defaults to the start of the sandbox
         :param end: End time for the metrics, defaults to the current time
 
         :return: List of sandbox metrics containing CPU, memory and disk usage information
         """
+        if self.connection_config.debug:
+            # Skip getting the metrics in debug mode
+            return []
+
         if self._envd_version < Version("0.1.5"):
-            raise SandboxException(
-                "Metrics are not supported in this version of the sandbox, please rebuild your template."
+            raise TemplateException(
+                "You need to update the template to use the new SDK."
             )
 
         if self._envd_version < Version("0.2.4"):
@@ -606,9 +609,11 @@ class Sandbox(SandboxApi):
     def pause(
         self,
         **opts: Unpack[ApiParams],
-    ) -> None:
+    ) -> bool:
         """
         Pause the sandbox.
+
+        :return: `True` if the sandbox got paused, `False` if the sandbox was already paused
         """
         ...
 
@@ -617,11 +622,13 @@ class Sandbox(SandboxApi):
     def pause(
         sandbox_id: str,
         **opts: Unpack[ApiParams],
-    ) -> None:
+    ) -> bool:
         """
         Pause the sandbox specified by sandbox ID.
 
         :param sandbox_id: Sandbox ID
+
+        :return: `True` if the sandbox got paused, `False` if the sandbox was already paused
         """
         ...
 
@@ -629,14 +636,14 @@ class Sandbox(SandboxApi):
     def pause(
         self,
         **opts: Unpack[ApiParams],
-    ) -> None:
+    ) -> bool:
         """
         Pause the sandbox.
 
-        :return: Sandbox ID that can be used to resume the sandbox
+        :return: `True` if the sandbox got paused, `False` if the sandbox was already paused
         """
 
-        SandboxApi._cls_pause(
+        return SandboxApi._cls_pause(
             sandbox_id=self.sandbox_id,
             **self.connection_config.get_api_params(**opts),
         )
@@ -645,24 +652,26 @@ class Sandbox(SandboxApi):
     def beta_pause(
         self,
         **opts: Unpack[ApiParams],
-    ) -> None: ...
+    ) -> bool: ...
 
     @overload
     @staticmethod
     def beta_pause(
         sandbox_id: str,
         **opts: Unpack[ApiParams],
-    ) -> None: ...
+    ) -> bool: ...
 
     @class_method_variant("_cls_pause")
     def beta_pause(
         self,
         **opts: Unpack[ApiParams],
-    ) -> None:
+    ) -> bool:
         """
         :deprecated: Use `pause()` instead.
+
+        :return: `True` if the sandbox got paused, `False` if the sandbox was already paused
         """
-        self.pause(**opts)
+        return self.pause(**opts)
 
     @overload
     def create_snapshot(
@@ -834,18 +843,30 @@ class Sandbox(SandboxApi):
         timeout: Optional[int] = None,
         **opts: Unpack[ApiParams],
     ) -> Self:
-        sandbox = SandboxApi._cls_connect(
-            sandbox_id=sandbox_id,
-            timeout=timeout,
-            **opts,
-        )
+        debug = ConnectionConfig(**opts).debug
+        if debug:
+            sandbox_domain = None
+            envd_version = ENVD_DEBUG_FALLBACK
+            envd_access_token = None
+            traffic_access_token = None
+        else:
+            sandbox = SandboxApi._cls_connect(
+                sandbox_id=sandbox_id,
+                timeout=timeout,
+                **opts,
+            )
+
+            sandbox_id = sandbox.sandbox_id
+            sandbox_domain = sandbox.sandbox_domain
+            envd_version = Version(sandbox.envd_version)
+            envd_access_token = sandbox.envd_access_token
+            traffic_access_token = sandbox.traffic_access_token
 
         sandbox_headers = {
-            "E2b-Sandbox-Id": sandbox.sandbox_id,
+            "E2b-Sandbox-Id": sandbox_id,
             "E2b-Sandbox-Port": str(ConnectionConfig.envd_port),
         }
-        envd_access_token = sandbox.envd_access_token
-        if envd_access_token is not None and not isinstance(envd_access_token, Unset):
+        if envd_access_token is not None:
             sandbox_headers["X-Access-Token"] = envd_access_token
 
         connection_config = ConnectionConfig(
@@ -854,12 +875,12 @@ class Sandbox(SandboxApi):
         )
 
         return cls(
-            sandbox_id=sandbox.sandbox_id,
-            sandbox_domain=sandbox.domain,
-            connection_config=connection_config,
-            envd_version=Version(sandbox.envd_version),
+            sandbox_id=sandbox_id,
+            sandbox_domain=sandbox_domain,
+            envd_version=envd_version,
             envd_access_token=envd_access_token,
-            traffic_access_token=sandbox.traffic_access_token,
+            traffic_access_token=traffic_access_token,
+            connection_config=connection_config,
         )
 
     @classmethod
@@ -879,7 +900,7 @@ class Sandbox(SandboxApi):
     ) -> Self:
         extra_sandbox_headers = {}
 
-        debug = opts.get("debug")
+        debug = ConnectionConfig(**opts).debug
         if debug:
             sandbox_id = "debug_sandbox_id"
             sandbox_domain = None
@@ -907,9 +928,7 @@ class Sandbox(SandboxApi):
             envd_access_token = response.envd_access_token
             traffic_access_token = response.traffic_access_token
 
-            if envd_access_token is not None and not isinstance(
-                envd_access_token, Unset
-            ):
+            if envd_access_token is not None:
                 extra_sandbox_headers["X-Access-Token"] = envd_access_token
 
         extra_sandbox_headers["E2b-Sandbox-Id"] = sandbox_id

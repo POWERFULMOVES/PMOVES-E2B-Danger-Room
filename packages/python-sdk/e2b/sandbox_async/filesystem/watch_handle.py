@@ -1,10 +1,11 @@
 import asyncio
 import inspect
 
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Awaitable, Callable, Optional
 
-from e2b.envd.rpc import handle_rpc_exception
+from e2b.envd.rpc import ahandle_rpc_exception_with_health
 from e2b.envd.filesystem.filesystem_pb2 import WatchDirResponse
+from e2b.sandbox.filesystem.filesystem import map_entry_info
 from e2b.sandbox.filesystem.watch_handle import FilesystemEvent, map_event_type
 from e2b.sandbox_async.utils import OutputHandler
 
@@ -21,10 +22,12 @@ class AsyncWatchHandle:
         events: AsyncGenerator[WatchDirResponse, Any],
         on_event: OutputHandler[FilesystemEvent],
         on_exit: Optional[OutputHandler[Exception]] = None,
+        check_health: Optional[Callable[[], Awaitable[Optional[bool]]]] = None,
     ):
         self._events = events
         self._on_event = on_event
         self._on_exit = on_exit
+        self._check_health = check_health
 
         self._wait = asyncio.create_task(self._handle_events())
 
@@ -48,9 +51,14 @@ class AsyncWatchHandle:
                         yield FilesystemEvent(
                             name=event.filesystem.name,
                             type=event_type,
+                            entry=(
+                                map_entry_info(event.filesystem.entry)
+                                if event.filesystem.HasField("entry")
+                                else None
+                            ),
                         )
         except Exception as e:
-            raise handle_rpc_exception(e)
+            raise await ahandle_rpc_exception_with_health(e, self._check_health)
 
     async def _handle_events(self):
         try:

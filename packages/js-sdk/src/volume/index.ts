@@ -66,6 +66,11 @@ export class Volume {
   readonly debug?: boolean
 
   /**
+   * Proxy URL used for requests to the volume content API.
+   */
+  readonly proxy?: string
+
+  /**
    * Create a local Volume instance with no API call.
    *
    * @param volumeId volume ID.
@@ -73,19 +78,22 @@ export class Volume {
    * @param token volume auth token.
    * @param domain domain for the volume API.
    * @param debug whether to use debug mode.
+   * @param proxy proxy URL for the volume content API.
    */
   constructor(
     volumeId: string,
     name: string,
     token: string,
     domain?: string,
-    debug?: boolean
+    debug?: boolean,
+    proxy?: string
   ) {
     this.volumeId = volumeId
     this.name = name
     this.token = token
     this.domain = domain
     this.debug = debug
+    this.proxy = proxy
   }
 
   /**
@@ -121,7 +129,8 @@ export class Volume {
       res.data.name,
       res.data.token,
       config.domain,
-      config.debug
+      config.debug,
+      config.proxy
     )
   }
 
@@ -139,7 +148,14 @@ export class Volume {
   ): Promise<Volume> {
     const config = new ConnectionConfig(opts)
     const { name, token } = await Volume.getInfo(volumeId, opts)
-    return new Volume(volumeId, name, token, config.domain, config.debug)
+    return new Volume(
+      volumeId,
+      name,
+      token,
+      config.domain,
+      config.debug,
+      config.proxy
+    )
   }
 
   /**
@@ -545,19 +561,22 @@ export class Volume {
       throw err
     }
 
+    // When the file is empty, `res.data` is `undefined`, so empty values are synthesized below.
     if (format === 'bytes') {
-      return new Uint8Array(res.data as ArrayBuffer)
+      return res.data instanceof ArrayBuffer
+        ? new Uint8Array(res.data)
+        : new Uint8Array()
     }
 
     if (format === 'text') {
-      // When the file is empty, res.data is parsed as `{}`. This is a workaround to return an empty string.
-      if (res.response.headers.get('content-length') === '0') {
-        return ''
-      }
       return typeof res.data === 'string' ? res.data : ''
     }
 
-    return res.data
+    if (format === 'blob') {
+      return res.data instanceof Blob ? res.data : new Blob([])
+    }
+
+    return res.data instanceof ReadableStream ? res.data : new Blob([]).stream()
   }
 
   /**

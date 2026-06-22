@@ -1,8 +1,8 @@
 import type { PathLike } from 'node:fs'
 import { ApiClient } from '../api'
 import { ConnectionConfig, ConnectionOpts } from '../connectionConfig'
-import { BuildError } from '../errors'
-import { runtime } from '../utils'
+import { BuildError, InvalidArgumentError } from '../errors'
+import { runtime, shellQuote } from '../utils'
 import {
   assignTags,
   checkAliasExists,
@@ -270,7 +270,7 @@ export class TemplateBase
       {
         templateID: data.templateId,
         buildID: data.buildId,
-        logsOffset: options?.logsOffset,
+        logsOffset: options?.logsOffset ?? 0,
       },
       config.getSignal(undefined, options?.signal)
     )
@@ -447,6 +447,14 @@ export class TemplateBase
     baseImage: string,
     credentials?: { username: string; password: string }
   ): TemplateBuilder {
+    // Validate before mutating the builder.
+    if (credentials && (!credentials.username || !credentials.password)) {
+      throw new InvalidArgumentError(
+        'Both username and password are required when providing registry credentials',
+        getCallerFrame(STACK_TRACE_DEPTH - 1)
+      )
+    }
+
     this.baseImage = baseImage
     this.baseTemplate = undefined
 
@@ -591,9 +599,12 @@ export class TemplateBase
         forceUpload: options?.forceUpload,
         resolveSymlinks: options?.resolveSymlinks,
       })
+
+      // Collect one stack trace per pushed instruction so build steps stay
+      // aligned with their stack traces when copying multiple sources
+      this.collectStackTrace()
     }
 
-    this.collectStackTrace()
     return this
   }
 
@@ -605,7 +616,9 @@ export class TemplateBase
     // Stack trace that will be used to re-throw the error with
     const stackTrace = getCallerFrame(STACK_TRACE_DEPTH - 1)
 
-    this.runInNewStackTraceContext(() => {
+    // Use the override so each copied item collects this stack trace,
+    // keeping build steps aligned with their stack traces
+    this.runInStackTraceOverrideContext(() => {
       for (const item of items) {
         try {
           this.copy(item.src, item.dest, {
@@ -620,7 +633,7 @@ export class TemplateBase
           throw copyError
         }
       }
-    })
+    }, stackTrace)
 
     return this
   }
@@ -637,7 +650,7 @@ export class TemplateBase
     if (options?.force) {
       args.push('-f')
     }
-    args.push(...paths.map((p) => p.toString()))
+    args.push(...paths.map((p) => shellQuote(p.toString())))
     return this.runInNewStackTraceContext(() =>
       this.runCmd(args.join(' '), { user: options?.user })
     )
@@ -648,7 +661,7 @@ export class TemplateBase
     dest: PathLike,
     options?: { force?: boolean; user?: string }
   ): TemplateBuilder {
-    const args = ['mv', src.toString(), dest.toString()]
+    const args = ['mv', shellQuote(src.toString()), shellQuote(dest.toString())]
     if (options?.force) {
       args.push('-f')
     }
@@ -666,7 +679,7 @@ export class TemplateBase
     if (options?.mode) {
       args.push(`-m ${padOctal(options.mode)}`)
     }
-    args.push(...paths.map((p) => p.toString()))
+    args.push(...paths.map((p) => shellQuote(p.toString())))
     return this.runInNewStackTraceContext(() =>
       this.runCmd(args.join(' '), { user: options?.user })
     )
@@ -681,7 +694,7 @@ export class TemplateBase
     if (options?.force) {
       args.push('-f')
     }
-    args.push(src.toString(), dest.toString())
+    args.push(shellQuote(src.toString()), shellQuote(dest.toString()))
     return this.runInNewStackTraceContext(() =>
       this.runCmd(args.join(' '), { user: options?.user })
     )
@@ -855,16 +868,16 @@ export class TemplateBase
     path?: PathLike,
     options?: { branch?: string; depth?: number; user?: string }
   ): TemplateBuilder {
-    const args = ['git', 'clone', url]
+    const args = ['git', 'clone', shellQuote(url)]
     if (options?.branch) {
-      args.push(`--branch ${options.branch}`)
+      args.push(`--branch ${shellQuote(options.branch)}`)
       args.push('--single-branch')
     }
     if (options?.depth) {
       args.push(`--depth ${options.depth}`)
     }
     if (path) {
-      args.push(path.toString())
+      args.push(shellQuote(path.toString()))
     }
 
     return this.runInNewStackTraceContext(() =>
@@ -928,7 +941,7 @@ export class TemplateBase
 
     return this.runInNewStackTraceContext(() => {
       return this.runCmd(
-        `devcontainer build --workspace-folder ${devcontainerDirectory}`,
+        `devcontainer build --workspace-folder ${shellQuote(devcontainerDirectory)}`,
         { user: 'root' }
       )
     })
@@ -943,8 +956,9 @@ export class TemplateBase
     }
 
     return this.runInNewStackTraceContext(() => {
+      const dir = shellQuote(devcontainerDirectory)
       return this.setStartCmd(
-        `sudo devcontainer up --workspace-folder ${devcontainerDirectory} && sudo /prepare-exec.sh ${devcontainerDirectory} | sudo tee /devcontainer.sh > /dev/null && sudo chmod +x /devcontainer.sh && sudo touch /devcontainer.up`,
+        `sudo devcontainer up --workspace-folder ${dir} && sudo /prepare-exec.sh ${dir} | sudo tee /devcontainer.sh > /dev/null && sudo chmod +x /devcontainer.sh && sudo touch /devcontainer.up`,
         waitForFile('/devcontainer.up')
       )
     })
@@ -998,8 +1012,12 @@ export class TemplateBase
    */
   private runInNewStackTraceContext<T>(fn: () => T): T {
     this.disableStackTrace()
-    const result = fn()
-    this.enableStackTrace()
+    let result: T
+    try {
+      result = fn()
+    } finally {
+      this.enableStackTrace()
+    }
     this.collectStackTrace(STACK_TRACE_DEPTH + 1)
     return result
   }
@@ -1009,9 +1027,11 @@ export class TemplateBase
     stackTraceOverride: string | undefined
   ): T {
     this.stackTracesOverride = stackTraceOverride
-    const result = fn()
-    this.stackTracesOverride = undefined
-    return result
+    try {
+      return fn()
+    } finally {
+      this.stackTracesOverride = undefined
+    }
   }
 
   /**

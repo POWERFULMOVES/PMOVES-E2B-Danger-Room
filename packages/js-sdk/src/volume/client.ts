@@ -2,10 +2,12 @@ import createClient from 'openapi-fetch'
 
 import type { components, paths } from './schema.gen'
 import { defaultHeaders, getEnvVar } from '../api/metadata'
+import { createApiFetch } from '../api/http2'
 import { buildRequestSignal } from '../connectionConfig'
 import { createApiLogger, Logger } from '../logs'
 import type { Volume } from './index'
 
+const REQUEST_TIMEOUT_MS = 60_000 // 60 seconds
 const FILE_TIMEOUT_MS = 3_600_000 // 1 hour
 
 export interface VolumeApiOpts {
@@ -50,6 +52,13 @@ export interface VolumeApiOpts {
   headers?: Record<string, string>
 
   /**
+   * Proxy URL to use for requests.
+   *
+   * @example 'http://user:pass@127.0.0.1:8080'
+   */
+  proxy?: string
+
+  /**
    * An optional `AbortSignal` that can be used to cancel the in-flight request.
    * When the signal is aborted, the underlying `fetch` is aborted and the
    * returned promise rejects with an `AbortError`.
@@ -64,8 +73,9 @@ export class VolumeConnectionConfig {
   readonly token?: string
   readonly headers?: Record<string, string>
   readonly logger?: Logger
-  readonly requestTimeoutMs?: number
+  readonly requestTimeoutMs: number
   readonly signal?: AbortSignal
+  readonly proxy?: string
 
   constructor(volume: Volume, opts?: VolumeApiOpts) {
     this.domain = opts?.domain || volume.domain || VolumeConnectionConfig.domain
@@ -77,8 +87,9 @@ export class VolumeConnectionConfig {
     this.token = opts?.token || volume.token
     this.headers = opts?.headers
     this.logger = opts?.logger
-    this.requestTimeoutMs = opts?.requestTimeoutMs
+    this.requestTimeoutMs = opts?.requestTimeoutMs ?? REQUEST_TIMEOUT_MS
     this.signal = opts?.signal
+    this.proxy = opts?.proxy || volume.proxy
   }
 
   private static get domain() {
@@ -110,6 +121,7 @@ class VolumeApiClient {
   constructor(config: VolumeConnectionConfig) {
     this.api = createClient<paths>({
       baseUrl: config.apiUrl,
+      fetch: createApiFetch(config.proxy),
       headers: {
         ...defaultHeaders,
         ...(config.token && { Authorization: `Bearer ${config.token}` }),

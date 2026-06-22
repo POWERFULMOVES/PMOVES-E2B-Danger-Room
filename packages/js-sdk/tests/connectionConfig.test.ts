@@ -13,6 +13,7 @@ beforeEach(() => {
     E2B_DOMAIN: process.env.E2B_DOMAIN,
     E2B_SANDBOX_URL: process.env.E2B_SANDBOX_URL,
     E2B_DEBUG: process.env.E2B_DEBUG,
+    E2B_VALIDATE_API_KEY: process.env.E2B_VALIDATE_API_KEY,
   }
 })
 
@@ -146,6 +147,65 @@ test('sandbox_url stays localhost in debug mode', () => {
   )
 })
 
+test('validateApiKey defaults to true', () => {
+  delete process.env.E2B_VALIDATE_API_KEY
+
+  const config = new ConnectionConfig()
+  assert.equal(config.validateApiKey, true)
+})
+
+test('validateApiKey disabled via env var', () => {
+  process.env.E2B_VALIDATE_API_KEY = 'false'
+
+  const config = new ConnectionConfig()
+  assert.equal(config.validateApiKey, false)
+})
+
+test('validateApiKey in args has priority over env var', () => {
+  process.env.E2B_VALIDATE_API_KEY = 'true'
+
+  const config = new ConnectionConfig({ validateApiKey: false })
+  assert.equal(config.validateApiKey, false)
+})
+
+test('debug false in args overrides E2B_DEBUG env var', () => {
+  process.env.E2B_DEBUG = 'true'
+
+  const config = new ConnectionConfig({ debug: false })
+  assert.equal(config.debug, false)
+})
+
+test('debug defaults to E2B_DEBUG env var', () => {
+  process.env.E2B_DEBUG = 'true'
+
+  const config = new ConnectionConfig()
+  assert.equal(config.debug, true)
+})
+
+test('integration options are appended to the user agent', () => {
+  const config = new ConnectionConfig({
+    integration: 'testing/version',
+  })
+
+  assert.equal(config.headers?.['User-Agent']?.startsWith('e2b-js-sdk/'), true)
+  assert.equal(
+    config.headers?.['User-Agent']?.endsWith(' testing/version'),
+    true
+  )
+})
+
+test('integration option survives config rebuilds', () => {
+  const config = new ConnectionConfig({
+    integration: 'testing/version',
+  })
+  const rebuiltConfig = new ConnectionConfig({ ...config })
+
+  assert.equal(
+    rebuiltConfig.headers?.['User-Agent']?.endsWith(' testing/version'),
+    true
+  )
+})
+
 test('getSignal returns user signal when no timeout is set', () => {
   const config = new ConnectionConfig({ requestTimeoutMs: 0 })
   const controller = new AbortController()
@@ -174,6 +234,31 @@ test('getSignal returns undefined when no timeout and no signal', () => {
   const config = new ConnectionConfig({ requestTimeoutMs: 0 })
   const signal = config.getSignal(0)
   assert.equal(signal, undefined)
+})
+
+test('requestTimeoutMs 0 from the config disables the timeout', () => {
+  const config = new ConnectionConfig({ requestTimeoutMs: 0 })
+  // The stored value is kept as 0 (not replaced by the default).
+  assert.equal(config.requestTimeoutMs, 0)
+  // getSignal() with no per-call arg falls back to the stored 0, which must
+  // NOT produce a timeout signal.
+  assert.equal(config.getSignal(), undefined)
+  // With only a user signal, no timeout signal is layered on top.
+  const controller = new AbortController()
+  assert.strictEqual(
+    config.getSignal(undefined, controller.signal),
+    controller.signal
+  )
+})
+
+test('setupRequestController with config timeout 0 never auto-aborts', async () => {
+  const config = new ConnectionConfig({ requestTimeoutMs: 0 })
+  const { controller } = setupRequestController(
+    config.requestTimeoutMs,
+    undefined
+  )
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  assert.equal(controller.signal.aborted, false)
 })
 
 test('setupRequestController aborts when user signal aborts', () => {
