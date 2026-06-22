@@ -31,9 +31,9 @@ export function handleApiError(
   ) => Error = SandboxError,
   stackTrace?: string
 ): Error | undefined {
-  // openapi-fetch returns empty string for error when response body is empty,
-  // so we check !== undefined instead of truthiness
-  if (response.error === undefined) {
+  // openapi-fetch leaves `error` undefined for non-2xx responses with
+  // Content-Length: 0, so check the status instead
+  if (response.response.ok) {
     return
   }
 
@@ -57,7 +57,8 @@ export function handleApiError(
     return new RateLimitError(message)
   }
 
-  const message = response.error?.message ?? response.error
+  const message =
+    response.error?.message || response.error || response.response.statusText
   return new errorClass(`${response.response.status}: ${message}`, stackTrace)
 }
 
@@ -70,32 +71,24 @@ class ApiClient {
   constructor(
     config: ConnectionConfig,
     opts: {
-      requireAccessToken?: boolean
       requireApiKey?: boolean
-    } = { requireAccessToken: false, requireApiKey: false }
+    } = {}
   ) {
-    if (opts?.requireApiKey && !config.apiKey) {
+    if ((opts.requireApiKey ?? true) && !config.apiKey) {
       throw new AuthenticationError(
-        'API key is required, please visit the Team tab at https://e2b.dev/dashboard to get your API key. ' +
+        'API key is required, please visit the API Keys tab at https://e2b.dev/dashboard?tab=keys to get your API key. ' +
           'You can either set the environment variable `E2B_API_KEY` ' +
           "or you can pass it directly to the sandbox like Sandbox.create({ apiKey: 'e2b_...' })"
       )
     }
 
-    if (config.apiKey) {
+    if (config.apiKey && config.validateApiKey) {
       validateApiKey(config.apiKey)
-    }
-
-    if (opts?.requireAccessToken && !config.accessToken) {
-      throw new AuthenticationError(
-        'Access token is required, please visit the Personal tab at https://e2b.dev/dashboard to get your access token. ' +
-          'You can set the environment variable `E2B_ACCESS_TOKEN` or pass the `accessToken` in options.'
-      )
     }
 
     this.api = createClient<paths>({
       baseUrl: config.apiUrl,
-      fetch: createApiFetch(),
+      fetch: createApiFetch(config.proxy),
       // In HTTP 1.1, all connections are considered persistent unless declared otherwise
       // keepalive: true,
       headers: {

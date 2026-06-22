@@ -2,6 +2,7 @@ from typing import Dict, List, Literal, Optional, Union, overload
 
 import e2b_connect
 import httpcore
+import httpx
 from packaging.version import Version
 from e2b.connection_config import (
     ConnectionConfig,
@@ -10,7 +11,8 @@ from e2b.connection_config import (
     KEEPALIVE_PING_INTERVAL_SEC,
 )
 from e2b.envd.process import process_connect, process_pb2
-from e2b.envd.rpc import authentication_header, handle_rpc_exception
+from e2b.envd.api import acheck_sandbox_health
+from e2b.envd.rpc import authentication_header, ahandle_rpc_exception_with_health
 from e2b.envd.versions import ENVD_COMMANDS_STDIN, ENVD_ENVD_CLOSE
 from e2b.exceptions import SandboxException
 from e2b.sandbox.commands.main import ProcessInfo
@@ -30,9 +32,11 @@ class Commands:
         connection_config: ConnectionConfig,
         pool: httpcore.AsyncConnectionPool,
         envd_version: Version,
+        envd_api: httpx.AsyncClient,
     ) -> None:
         self._connection_config = connection_config
         self._envd_version = envd_version
+        self._check_health = lambda: acheck_sandbox_health(envd_api)
         self._rpc = process_connect.ProcessClient(
             envd_api_url,
             # TODO: Fix and enable compression again — the headers compression is not solved for streaming.
@@ -63,16 +67,16 @@ class Commands:
             return [
                 ProcessInfo(
                     pid=p.pid,
-                    tag=p.tag,
+                    tag=p.tag if p.HasField("tag") else None,
                     cmd=p.config.cmd,
                     args=list(p.config.args),
                     envs=dict(p.config.envs),
-                    cwd=p.config.cwd,
+                    cwd=p.config.cwd if p.config.HasField("cwd") else None,
                 )
                 for p in res.processes
             ]
         except Exception as e:
-            raise handle_rpc_exception(e)
+            raise await ahandle_rpc_exception_with_health(e, self._check_health)
 
     async def kill(
         self,
@@ -103,12 +107,12 @@ class Commands:
             if isinstance(e, e2b_connect.ConnectException):
                 if e.status == e2b_connect.Code.not_found:
                     return False
-            raise handle_rpc_exception(e)
+            raise await ahandle_rpc_exception_with_health(e, self._check_health)
 
     async def send_stdin(
         self,
         pid: int,
-        data: str,
+        data: Union[str, bytes],
         request_timeout: Optional[float] = None,
     ) -> None:
         """
@@ -123,7 +127,7 @@ class Commands:
                 process_pb2.SendInputRequest(
                     process=process_pb2.ProcessSelector(pid=pid),
                     input=process_pb2.ProcessInput(
-                        stdin=data.encode(),
+                        stdin=data.encode() if isinstance(data, str) else data,
                     ),
                 ),
                 request_timeout=self._connection_config.get_request_timeout(
@@ -131,7 +135,7 @@ class Commands:
                 ),
             )
         except Exception as e:
-            raise handle_rpc_exception(e)
+            raise await ahandle_rpc_exception_with_health(e, self._check_health)
 
     async def close_stdin(
         self,
@@ -162,7 +166,7 @@ class Commands:
                 ),
             )
         except Exception as e:
-            raise handle_rpc_exception(e)
+            raise await ahandle_rpc_exception_with_health(e, self._check_health)
 
     @overload
     async def run(
@@ -256,9 +260,9 @@ class Commands:
             envs,
             user,
             cwd,
+            stdin,
             timeout,
             request_timeout,
-            stdin,
             on_stdout=on_stdout,
             on_stderr=on_stderr,
         )
@@ -271,9 +275,9 @@ class Commands:
         envs: Optional[Dict[str, str]],
         user: Optional[Username],
         cwd: Optional[str],
+        stdin: bool,
         timeout: Optional[float],
         request_timeout: Optional[float],
-        stdin: bool,
         on_stdout: Optional[OutputHandler[Stdout]],
         on_stderr: Optional[OutputHandler[Stderr]],
     ) -> AsyncCommandHandle:
@@ -312,11 +316,20 @@ class Commands:
                 events=events,
                 on_stdout=on_stdout,
                 on_stderr=on_stderr,
-                handle_send_stdin=lambda data: self.send_stdin(pid, data),
-                handle_close_stdin=lambda: self.close_stdin(pid),
+                handle_send_stdin=lambda data, request_timeout=None: self.send_stdin(
+                    pid, data, request_timeout
+                ),
+                handle_close_stdin=lambda request_timeout=None: self.close_stdin(
+                    pid, request_timeout
+                ),
+                check_health=self._check_health,
             )
         except Exception as e:
-            raise handle_rpc_exception(e)
+            try:
+                await events.aclose()
+            except Exception:
+                pass
+            raise await ahandle_rpc_exception_with_health(e, self._check_health)
 
     async def connect(
         self,
@@ -342,13 +355,13 @@ class Commands:
             process_pb2.ConnectRequest(
                 process=process_pb2.ProcessSelector(pid=pid),
             ),
+            headers={
+                KEEPALIVE_PING_HEADER: str(KEEPALIVE_PING_INTERVAL_SEC),
+            },
             timeout=timeout,
             request_timeout=self._connection_config.get_request_timeout(
                 request_timeout
             ),
-            headers={
-                KEEPALIVE_PING_HEADER: str(KEEPALIVE_PING_INTERVAL_SEC),
-            },
         )
 
         try:
@@ -366,8 +379,17 @@ class Commands:
                 events=events,
                 on_stdout=on_stdout,
                 on_stderr=on_stderr,
-                handle_send_stdin=lambda data: self.send_stdin(pid, data),
-                handle_close_stdin=lambda: self.close_stdin(pid),
+                handle_send_stdin=lambda data, request_timeout=None: self.send_stdin(
+                    pid, data, request_timeout
+                ),
+                handle_close_stdin=lambda request_timeout=None: self.close_stdin(
+                    pid, request_timeout
+                ),
+                check_health=self._check_health,
             )
         except Exception as e:
-            raise handle_rpc_exception(e)
+            try:
+                await events.aclose()
+            except Exception:
+                pass
+            raise await ahandle_rpc_exception_with_health(e, self._check_health)

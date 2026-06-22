@@ -22,7 +22,18 @@ export interface ConnectionOpts {
    */
   apiKey?: string
   /**
+   * Whether to validate the format of the E2B API key on the client side.
+   * Disable this when your deployment issues API keys that don't match the
+   * default `e2b_` format.
+   *
+   * @default E2B_VALIDATE_API_KEY // environment variable or `true`
+   */
+  validateApiKey?: boolean
+  /**
    * E2B access token to use for authentication.
+   *
+   * @deprecated Pass the token through `apiHeaders` instead, e.g.
+   * `apiHeaders: { Authorization: \`Bearer ${token}\` }`.
    *
    * @default E2B_ACCESS_TOKEN // environment variable
    */
@@ -70,9 +81,24 @@ export interface ConnectionOpts {
   headers?: Record<string, string>
 
   /**
+   * Proxy URL to use for requests. In case of a sandbox it applies to all
+   * requests made to the returned sandbox.
+   *
+   * @example 'http://user:pass@127.0.0.1:8080'
+   */
+  proxy?: string
+
+  /**
    * Additional headers to send with E2B API requests.
    */
   apiHeaders?: Record<string, string>
+
+  /**
+   * Integration wrapping the E2B SDK, appended to the `User-Agent`.
+   *
+   * @example 'e2b-code-interpreter/0.1.0'
+   */
+  integration?: string
 
   /**
    * An optional `AbortSignal` that can be used to cancel the in-flight request.
@@ -94,6 +120,7 @@ export function buildRequestSignal(
   requestTimeoutMs: number | undefined,
   userSignal: AbortSignal | undefined
 ): AbortSignal | undefined {
+  // `0` (and `undefined`) disable the request timeout.
   const timeoutSignal = requestTimeoutMs
     ? AbortSignal.timeout(requestTimeoutMs)
     : undefined
@@ -174,6 +201,16 @@ export function setupRequestController(
   return { controller, clearStartTimeout, cleanup }
 }
 
+function buildUserAgent(integration?: string) {
+  const userAgentParts = [`e2b-js-sdk/${version}`]
+
+  if (integration) {
+    userAgentParts.push(integration)
+  }
+
+  return userAgentParts.join(' ')
+}
+
 /**
  * Configuration for connecting to the API.
  */
@@ -189,19 +226,31 @@ export class ConnectionConfig {
   readonly requestTimeoutMs: number
 
   readonly apiKey?: string
+  readonly validateApiKey: boolean
+  /**
+   * @deprecated Pass the token through `apiHeaders` instead.
+   */
   readonly accessToken?: string
+
+  readonly integration?: string
 
   readonly headers?: Record<string, string>
 
+  readonly proxy?: string
+
   constructor(opts?: ConnectionOpts) {
     this.apiKey = opts?.apiKey || ConnectionConfig.apiKey
-    this.debug = opts?.debug || ConnectionConfig.debug
+    this.validateApiKey =
+      opts?.validateApiKey ?? ConnectionConfig.validateApiKey
+    this.debug = opts?.debug ?? ConnectionConfig.debug
     this.domain = opts?.domain || ConnectionConfig.domain
     this.accessToken = opts?.accessToken || ConnectionConfig.accessToken
     this.requestTimeoutMs = opts?.requestTimeoutMs ?? REQUEST_TIMEOUT_MS
     this.logger = opts?.logger
+    this.integration = opts?.integration
     this.headers = { ...(opts?.headers ?? {}), ...(opts?.apiHeaders ?? {}) }
-    this.headers['User-Agent'] = `e2b-js-sdk/${version}`
+    this.headers['User-Agent'] = buildUserAgent(this.integration)
+    this.proxy = opts?.proxy
 
     this.apiUrl =
       opts?.apiUrl ||
@@ -229,6 +278,12 @@ export class ConnectionConfig {
 
   private static get apiKey() {
     return getEnvVar('E2B_API_KEY')
+  }
+
+  private static get validateApiKey() {
+    return (
+      (getEnvVar('E2B_VALIDATE_API_KEY') || 'true').toLowerCase() !== 'false'
+    )
   }
 
   private static get accessToken() {

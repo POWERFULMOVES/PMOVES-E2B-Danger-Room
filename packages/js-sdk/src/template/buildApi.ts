@@ -1,6 +1,6 @@
-import { ApiClient, handleApiError, paths, components } from '../api'
+import { ApiClient, handleApiError, components } from '../api'
 import { buildRequestSignal } from '../connectionConfig'
-import { dynamicImport, stripAnsi } from '../utils'
+import { dynamicImport } from '../utils'
 import { BuildError, FileUploadError, TemplateError } from '../errors'
 import { FILE_UPLOAD_TIMEOUT_MS } from './consts'
 import { LogEntry } from './logger'
@@ -41,11 +41,9 @@ type CheckAliasExistsInput = {
   alias: string
 }
 
-type ApiBuildStatusResponse =
-  paths['/templates/{templateID}/builds/{buildID}/status']['get']['responses']['200']['content']['application/json']
+type ApiBuildStatusResponse = components['schemas']['TemplateBuildInfo']
 
-export type TriggerBuildTemplate =
-  paths['/v2/templates/{templateID}/builds/{buildID}']['post']['requestBody']['content']['application/json']
+export type TriggerBuildTemplate = components['schemas']['TemplateBuildStartV2']
 
 export async function requestBuild(
   client: ApiClient,
@@ -311,9 +309,7 @@ export async function waitForBuildFinish(
   let logsOffset = 0
   let status: TemplateBuildStatus = 'building'
 
-  while (status === 'building' || status === 'waiting') {
-    signal?.throwIfAborted()
-
+  const pollStatus = async (): Promise<TemplateBuildStatusResponse> => {
     const buildStatus = await getBuildStatus(
       client,
       {
@@ -325,26 +321,33 @@ export async function waitForBuildFinish(
     )
 
     logsOffset += buildStatus.logEntries.length
+    buildStatus.logEntries.forEach((logEntry) => onBuildLogs?.(logEntry))
 
-    buildStatus.logEntries.forEach((logEntry) =>
-      onBuildLogs?.(
-        new LogEntry(
-          logEntry.timestamp,
-          logEntry.level,
-          stripAnsi(logEntry.message)
-        )
-      )
-    )
+    return buildStatus
+  }
+
+  while (status === 'building' || status === 'waiting') {
+    signal?.throwIfAborted()
+
+    const buildStatus = await pollStatus()
 
     status = buildStatus.status
     switch (status) {
-      case 'ready': {
-        return
-      }
-      case 'waiting': {
-        break
-      }
+      case 'ready':
       case 'error': {
+        // The status endpoint returns at most 100 log entries per call, so
+        // the terminal response may not include the last logs — keep
+        // fetching until they are drained.
+        let tailStatus = buildStatus
+        while (tailStatus.logEntries.length > 0) {
+          signal?.throwIfAborted()
+          tailStatus = await pollStatus()
+        }
+
+        if (status === 'ready') {
+          return
+        }
+
         let stackError: string | undefined
         if (buildStatus.reason?.step !== undefined) {
           const step = getBuildStepIndex(
@@ -358,6 +361,9 @@ export async function waitForBuildFinish(
           buildStatus?.reason?.message ?? 'Unknown error',
           stackError
         )
+      }
+      case 'waiting': {
+        break
       }
     }
 

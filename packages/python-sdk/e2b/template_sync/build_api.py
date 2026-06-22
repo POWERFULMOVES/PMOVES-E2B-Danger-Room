@@ -110,8 +110,14 @@ def upload_file(
         tar_buffer = tar_file_stream(
             file_name, context_path, ignore_patterns, resolve_symlinks
         )
-        client = api_client.get_httpx_client()
-        response = client.put(url, content=tar_buffer.getvalue())
+        with httpx.Client(
+            timeout=api_client._timeout,
+            verify=api_client._verify_ssl,
+            follow_redirects=api_client._follow_redirects,
+            proxy=getattr(api_client, "_proxy", None),
+            http2=False,
+        ) as client:
+            response = client.put(url, content=tar_buffer.getvalue())
         response.raise_for_status()
     except httpx.HTTPStatusError as e:
         raise FileUploadException(f"Failed to upload file: {e}").with_traceback(
@@ -210,7 +216,8 @@ def wait_for_build_finish(
     logs_offset = 0
     status = TemplateBuildStatus.BUILDING
 
-    while status in [TemplateBuildStatus.BUILDING, TemplateBuildStatus.WAITING]:
+    def poll_status() -> TemplateBuildStatusResponse:
+        nonlocal logs_offset
         build_status = get_build_status(client, template_id, build_id, logs_offset)
 
         logs_offset += len(build_status.log_entries)
@@ -219,15 +226,24 @@ def wait_for_build_finish(
             if on_build_logs:
                 on_build_logs(log_entry)
 
+        return build_status
+
+    while status in [TemplateBuildStatus.BUILDING, TemplateBuildStatus.WAITING]:
+        build_status = poll_status()
+
         status = build_status.status
 
-        if status == TemplateBuildStatus.READY:
-            return
+        if status in [TemplateBuildStatus.READY, TemplateBuildStatus.ERROR]:
+            # The status endpoint returns at most 100 log entries per call, so
+            # the terminal response may not include the last logs - keep
+            # fetching until they are drained.
+            tail_status = build_status
+            while len(tail_status.log_entries) > 0:
+                tail_status = poll_status()
 
-        elif status == TemplateBuildStatus.WAITING:
-            pass
+            if status == TemplateBuildStatus.READY:
+                return
 
-        elif status == TemplateBuildStatus.ERROR:
             traceback = None
             if build_status.reason and build_status.reason.step:
                 # Find the corresponding stack trace for the failed step

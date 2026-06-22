@@ -1,9 +1,10 @@
 import json
+import shlex
 from typing import Dict, List, Optional, Union, Literal
 from pathlib import Path
 
 
-from e2b.exceptions import BuildException
+from e2b.exceptions import BuildException, InvalidArgumentException
 from e2b.template.consts import STACK_TRACE_DEPTH, RESOLVE_SYMLINKS
 from e2b.template.dockerfile_parser import parse_dockerfile
 from e2b.template.readycmd import ReadyCmd, wait_for_file
@@ -93,7 +94,11 @@ class TemplateBuilder:
 
             self._template._instructions.append(instruction)
 
-        self._template._collect_stack_trace()
+            # Collect one stack trace per pushed instruction so build steps
+            # stay aligned with their stack traces when copying multiple
+            # sources
+            self._template._collect_stack_trace()
+
         return self
 
     def copy_items(self, items: List[CopyItem]) -> "TemplateBuilder":
@@ -133,7 +138,9 @@ class TemplateBuilder:
                         raise error.with_traceback(stack_trace)
                     raise
 
-        self._template._run_in_new_stack_trace_context(_copy_items)
+        # Use the override so each copied item collects this stack trace,
+        # keeping build steps aligned with their stack traces
+        self._template._run_in_stack_trace_override_context(_copy_items, stack_trace)
         return self
 
     def remove(
@@ -165,7 +172,7 @@ class TemplateBuilder:
             args.append("-r")
         if force:
             args.append("-f")
-        args.extend([str(p) for p in paths])
+        args.extend([shlex.quote(str(p)) for p in paths])
 
         return self._template._run_in_new_stack_trace_context(
             lambda: self.run_cmd(" ".join(args), user=user)
@@ -194,7 +201,7 @@ class TemplateBuilder:
         template.rename('/tmp/old.txt', '/tmp/new.txt', user='root')
         ```
         """
-        args = ["mv", str(src), str(dest)]
+        args = ["mv", shlex.quote(str(src)), shlex.quote(str(dest))]
         if force:
             args.append("-f")
 
@@ -228,7 +235,7 @@ class TemplateBuilder:
         args = ["mkdir", "-p"]
         if mode:
             args.append(f"-m {pad_octal(mode)}")
-        args.extend([str(p) for p in path_list])
+        args.extend([shlex.quote(str(p)) for p in path_list])
 
         return self._template._run_in_new_stack_trace_context(
             lambda: self.run_cmd(" ".join(args), user=user)
@@ -261,7 +268,7 @@ class TemplateBuilder:
         args = ["ln", "-s"]
         if force:
             args.append("-f")
-        args.extend([str(src), str(dest)])
+        args.extend([shlex.quote(str(src)), shlex.quote(str(dest))])
         return self._template._run_in_new_stack_trace_context(
             lambda: self.run_cmd(" ".join(args), user=user)
         )
@@ -548,14 +555,14 @@ class TemplateBuilder:
         template.git_clone('https://github.com/user/repo.git', '/app/repo', user='root')
         ```
         """
-        args = ["git", "clone", url]
+        args = ["git", "clone", shlex.quote(url)]
         if branch:
-            args.append(f"--branch {branch}")
+            args.append(f"--branch {shlex.quote(branch)}")
             args.append("--single-branch")
         if depth:
             args.append(f"--depth {depth}")
         if path:
-            args.append(str(path))
+            args.append(shlex.quote(str(path)))
         return self._template._run_in_new_stack_trace_context(
             lambda: self.run_cmd(" ".join(args), user=user)
         )
@@ -586,7 +593,7 @@ class TemplateBuilder:
 
         return self._template._run_in_new_stack_trace_context(
             lambda: self.run_cmd(
-                f"devcontainer build --workspace-folder {devcontainer_directory}",
+                f"devcontainer build --workspace-folder {shlex.quote(str(devcontainer_directory))}",
                 user="root",
             )
         )
@@ -624,11 +631,12 @@ class TemplateBuilder:
             ).with_traceback(stack_trace)
 
         def _set_start():
+            dir_ = shlex.quote(str(devcontainer_directory))
             return self.set_start_cmd(
                 "sudo devcontainer up --workspace-folder "
-                + str(devcontainer_directory)
+                + dir_
                 + " && sudo /prepare-exec.sh "
-                + str(devcontainer_directory)
+                + dir_
                 + " | sudo tee /devcontainer.sh > /dev/null && sudo chmod +x /devcontainer.sh && sudo touch /devcontainer.up",
                 wait_for_file("/devcontainer.up"),
             )
@@ -864,8 +872,10 @@ class TemplateBase:
         :return: The result of the function
         """
         self._disable_stack_trace()
-        result = fn()
-        self._enable_stack_trace()
+        try:
+            result = fn()
+        finally:
+            self._enable_stack_trace()
         self._collect_stack_trace(STACK_TRACE_DEPTH + 1)
         return result
 
@@ -881,9 +891,10 @@ class TemplateBase:
         :return: The result of the function
         """
         self._stack_traces_override = stack_trace_override
-        result = fn()
-        self._stack_traces_override = None
-        return result
+        try:
+            return fn()
+        finally:
+            self._stack_traces_override = None
 
     # Built-in image mixins
     def from_debian_image(self, variant: str = "stable") -> TemplateBuilder:
@@ -1004,16 +1015,23 @@ class TemplateBase:
         Template().from_image('myregistry.com/myimage:latest', username='user', password='pass')
         ```
         """
-        self._base_image = image
-        self._base_template = None
+        # Validate (and resolve the registry config) before mutating the builder.
+        if username is not None or password is not None:
+            if not username or not password:
+                caller_frame = get_caller_frame(STACK_TRACE_DEPTH - 1)
+                stack_trace = make_traceback(caller_frame)
+                raise InvalidArgumentException(
+                    "Both username and password are required when providing registry credentials"
+                ).with_traceback(stack_trace)
 
-        # Set the registry config if provided
-        if username and password:
             self._registry_config = {
                 "type": "registry",
                 "username": username,
                 "password": password,
             }
+
+        self._base_image = image
+        self._base_template = None
 
         # If we should force the next layer and it's a FROM command, invalidate whole template
         if self._force_next_layer:

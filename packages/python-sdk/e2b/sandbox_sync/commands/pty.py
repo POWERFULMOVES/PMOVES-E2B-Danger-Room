@@ -1,9 +1,11 @@
 import e2b_connect
-import httpcore
+import httpx
+import threading
 
 from typing import Dict, Optional
 
 from packaging.version import Version
+from e2b.api.client_sync import get_envd_transport
 from e2b.envd.process import process_connect, process_pb2
 from e2b.connection_config import (
     Username,
@@ -12,7 +14,8 @@ from e2b.connection_config import (
     KEEPALIVE_PING_INTERVAL_SEC,
 )
 from e2b.exceptions import SandboxException
-from e2b.envd.rpc import authentication_header, handle_rpc_exception
+from e2b.envd.api import check_sandbox_health
+from e2b.envd.rpc import authentication_header, handle_rpc_exception_with_health
 from e2b.sandbox.commands.command_handle import PtySize
 from e2b.sandbox_sync.commands.command_handle import CommandHandle
 
@@ -26,19 +29,50 @@ class Pty:
         self,
         envd_api_url: str,
         connection_config: ConnectionConfig,
-        pool: httpcore.ConnectionPool,
         envd_version: Version,
     ) -> None:
+        self._envd_api_url = envd_api_url
         self._connection_config = connection_config
         self._envd_version = envd_version
-        self._rpc = process_connect.ProcessClient(
-            envd_api_url,
+        self._thread_local = threading.local()
+
+    def _create_envd_api(self) -> httpx.Client:
+        transport = get_envd_transport(self._connection_config)
+        return httpx.Client(
+            base_url=self._envd_api_url,
+            transport=transport,
+            headers=self._connection_config.sandbox_headers,
+        )
+
+    def _create_rpc(self) -> process_connect.ProcessClient:
+        transport = get_envd_transport(self._connection_config)
+        return process_connect.ProcessClient(
+            self._envd_api_url,
             # TODO: Fix and enable compression again — the headers compression is not solved for streaming.
             # compressor=e2b_connect.GzipCompressor,
-            pool=pool,
+            pool=transport.pool,
             json=True,
-            headers=connection_config.sandbox_headers,
+            headers=self._connection_config.sandbox_headers,
         )
+
+    @property
+    def _envd_api(self) -> httpx.Client:
+        envd_api = getattr(self._thread_local, "envd_api", None)
+        if envd_api is None:
+            envd_api = self._create_envd_api()
+            self._thread_local.envd_api = envd_api
+        return envd_api
+
+    @property
+    def _rpc(self) -> process_connect.ProcessClient:
+        rpc = getattr(self._thread_local, "rpc", None)
+        if rpc is None:
+            rpc = self._create_rpc()
+            self._thread_local.rpc = rpc
+        return rpc
+
+    def _check_health(self) -> Optional[bool]:
+        return check_sandbox_health(self._envd_api)
 
     def kill(
         self,
@@ -68,7 +102,7 @@ class Pty:
             if isinstance(e, e2b_connect.ConnectException):
                 if e.status == e2b_connect.Code.not_found:
                     return False
-            raise handle_rpc_exception(e)
+            raise handle_rpc_exception_with_health(e, self._check_health)
 
     def send_stdin(
         self,
@@ -96,7 +130,7 @@ class Pty:
                 ),
             )
         except Exception as e:
-            raise handle_rpc_exception(e)
+            raise handle_rpc_exception_with_health(e, self._check_health)
 
     def create(
         self,
@@ -119,7 +153,7 @@ class Pty:
 
         :return: Handle to interact with the PTY
         """
-        envs = envs or {}
+        envs = dict(envs) if envs else {}
         envs.setdefault("TERM", "xterm-256color")
         envs.setdefault("LANG", "C.UTF-8")
         envs.setdefault("LC_ALL", "C.UTF-8")
@@ -157,9 +191,14 @@ class Pty:
                 pid=start_event.event.start.pid,
                 handle_kill=lambda: self.kill(start_event.event.start.pid),
                 events=events,
+                check_health=self._check_health,
             )
         except Exception as e:
-            raise handle_rpc_exception(e)
+            try:
+                events.close()
+            except Exception:
+                pass
+            raise handle_rpc_exception_with_health(e, self._check_health)
 
     def connect(
         self,
@@ -201,9 +240,14 @@ class Pty:
                 pid=start_event.event.start.pid,
                 handle_kill=lambda: self.kill(start_event.event.start.pid),
                 events=events,
+                check_health=self._check_health,
             )
         except Exception as e:
-            raise handle_rpc_exception(e)
+            try:
+                events.close()
+            except Exception:
+                pass
+            raise handle_rpc_exception_with_health(e, self._check_health)
 
     def resize(
         self,
@@ -217,7 +261,7 @@ class Pty:
 
         :param pid: Process ID of the PTY
         :param size: New size of the PTY
-        :param request_timeout: Timeout for the request in **seconds**s
+        :param request_timeout: Timeout for the request in **seconds**
         """
         self._rpc.update(
             process_pb2.UpdateRequest(
