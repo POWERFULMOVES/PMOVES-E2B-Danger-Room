@@ -1,14 +1,13 @@
-import { assert } from 'vitest'
+import { assert, describe } from 'vitest'
 
 import { sandboxTest, isDebug } from '../setup.js'
-import { Sandbox } from '../../src'
 
 sandboxTest.skipIf(isDebug)(
   'pause and resume a sandbox',
   async ({ sandbox }) => {
     assert.isTrue(await sandbox.isRunning())
 
-    await sandbox.betaPause()
+    await sandbox.pause()
 
     assert.isFalse(await sandbox.isRunning())
 
@@ -19,36 +18,39 @@ sandboxTest.skipIf(isDebug)(
   }
 )
 
-sandboxTest.skipIf(isDebug)(
-  'pause and resume a sandbox with env vars',
-  async ({ template, sandboxTestId }) => {
-    // Environment variables of a process exist at runtime, and are not stored in some file or so.
-    // They are stored in the process's own memory
-    const sandbox = await Sandbox.create(template, {
+describe('pause and resume with env vars', () => {
+  sandboxTest.override({
+    sandboxOpts: {
       envs: { TEST_VAR: 'sfisback' },
-      metadata: { sandboxTestId },
-    })
+    },
+  })
 
-    const cmd = await sandbox.commands.run('echo "$TEST_VAR"')
+  sandboxTest.skipIf(isDebug)(
+    'pause and resume a sandbox with env vars',
+    async ({ sandbox }) => {
+      // Environment variables of a process exist at runtime, and are not stored in some file or so.
+      // They are stored in the process's own memory
+      const cmd = await sandbox.commands.run('echo "$TEST_VAR"')
 
-    assert.equal(cmd.exitCode, 0)
-    assert.equal(cmd.stdout.trim(), 'sfisback')
+      assert.equal(cmd.exitCode, 0)
+      assert.equal(cmd.stdout.trim(), 'sfisback')
 
-    await sandbox.betaPause()
+      await sandbox.pause()
 
-    assert.isFalse(await sandbox.isRunning())
+      assert.isFalse(await sandbox.isRunning())
 
-    const resumedSandbox = await sandbox.connect()
-    assert.isTrue(await sandbox.isRunning())
-    assert.isTrue(await resumedSandbox.isRunning())
-    assert.equal(resumedSandbox.sandboxId, sandbox.sandboxId)
+      const resumedSandbox = await sandbox.connect()
+      assert.isTrue(await sandbox.isRunning())
+      assert.isTrue(await resumedSandbox.isRunning())
+      assert.equal(resumedSandbox.sandboxId, sandbox.sandboxId)
 
-    const cmd2 = await sandbox.commands.run('echo "$TEST_VAR"')
+      const cmd2 = await sandbox.commands.run('echo "$TEST_VAR"')
 
-    assert.equal(cmd2.exitCode, 0)
-    assert.equal(cmd2.stdout.trim(), 'sfisback')
-  }
-)
+      assert.equal(cmd2.exitCode, 0)
+      assert.equal(cmd2.stdout.trim(), 'sfisback')
+    }
+  )
+})
 
 sandboxTest.skipIf(isDebug)(
   'pause and resume a sandbox with file',
@@ -66,7 +68,7 @@ sandboxTest.skipIf(isDebug)(
     const readContent = await sandbox.files.read(filename)
     assert.equal(readContent, content)
 
-    await sandbox.betaPause()
+    await sandbox.pause()
     assert.isFalse(await sandbox.isRunning())
 
     await sandbox.connect()
@@ -85,7 +87,7 @@ sandboxTest.skipIf(isDebug)(
     const cmd = await sandbox.commands.run('sleep 3600', { background: true })
     const expectedPid = cmd.pid
 
-    await sandbox.betaPause()
+    await sandbox.pause()
     assert.isFalse(await sandbox.isRunning())
 
     await sandbox.connect()
@@ -119,7 +121,7 @@ sandboxTest.skipIf(isDebug)(
     const exists = await sandbox.files.exists(filename)
     assert.isFalse(exists)
 
-    await sandbox.betaPause()
+    await sandbox.pause()
     assert.isFalse(await sandbox.isRunning())
 
     await sandbox.connect()
@@ -149,7 +151,7 @@ sandboxTest.skipIf(isDebug)(
     const response1 = await fetch(`https://${url}`)
     assert.equal(response1.status, 200)
 
-    await sandbox.betaPause()
+    await sandbox.pause()
     assert.isFalse(await sandbox.isRunning())
 
     await sandbox.connect()
@@ -158,5 +160,48 @@ sandboxTest.skipIf(isDebug)(
     url = await sandbox.getHost(8000)
     const response2 = await fetch(`https://${url}`)
     assert.equal(response2.status, 200)
+  }
+)
+
+sandboxTest.skipIf(isDebug)(
+  'filesystem-only pause reboots on resume but keeps the filesystem',
+  async ({ sandbox }) => {
+    // Absolute path: a cold boot may not restore the template's default
+    // user/cwd, so a relative path could resolve differently after resume.
+    const filename = '/home/user/fs_only_snapshot.txt'
+    const content = 'This is a filesystem-only snapshot test file.'
+
+    await sandbox.files.write(filename, content)
+
+    // Kernel boot id before the pause; it changes only across a real (cold)
+    // boot. Read via a command, not files.read: envd's non-gzip download path
+    // serves procfs files as an empty 200 (it sizes them by stat, which is 0),
+    // so clients that don't negotiate gzip — like workerd's fetch — silently
+    // get '' (infra#3363).
+    const bootBefore = (
+      await sandbox.commands.run('cat /proc/sys/kernel/random/boot_id')
+    ).stdout.trim()
+
+    // Filesystem-only snapshot: no memory is captured, so resuming cold-boots.
+    await sandbox.pause({ keepMemory: false })
+    assert.isFalse(await sandbox.isRunning())
+
+    // Resume the paused sandbox; a filesystem-only pause keeps no memory, so
+    // connect() cold-boots (reboots) it. connect() returns the same handle, and
+    // its credentials stay valid across the resume (the backend re-binds the
+    // same envd access token on the cold boot).
+    const resumedSandbox = await sandbox.connect()
+    assert.equal(resumedSandbox.sandboxId, sandbox.sandboxId)
+    assert.isTrue(await resumedSandbox.isRunning())
+
+    // The filesystem survives the cold boot.
+    assert.isTrue(await resumedSandbox.files.exists(filename))
+    assert.equal(await resumedSandbox.files.read(filename), content)
+
+    // A fresh boot id proves the guest rebooted rather than restoring memory.
+    const bootAfter = (
+      await resumedSandbox.commands.run('cat /proc/sys/kernel/random/boot_id')
+    ).stdout.trim()
+    assert.notEqual(bootAfter, bootBefore)
   }
 )

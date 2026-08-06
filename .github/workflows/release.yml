@@ -1,20 +1,25 @@
 name: Release
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
 
-concurrency: ${{ github.workflow }}-${{ github.ref }}
+# Shared literal group so production and candidate releases on the same ref serialize.
+concurrency: release-${{ github.ref }}
 
 permissions:
   id-token: write
   contents: write
 
 jobs:
-  is_release:
-    name: Is release?
+  preflight:
+    name: Release preflight
     runs-on: ubuntu-latest
     outputs:
       release: ${{ steps.version.outputs.release }}
+      js-sdk: ${{ steps.js.outputs.release }}
+      python-sdk: ${{ steps.python.outputs.release }}
+      cli: ${{ steps.cli.outputs.release }}
+      itinerary: ${{ steps.itinerary.outputs.itinerary }}
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v3
@@ -54,93 +59,93 @@ jobs:
           IS_RELEASE=$(./.github/scripts/is_release.sh)
           echo "release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
 
-  changes:
-    name: Repository changes
-    needs: [is_release]
-    if: needs.is_release.outputs.release == 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      js-sdk: ${{ steps.js.outputs.release }}
-      python-sdk: ${{ steps.python.outputs.release }}
-      cli: ${{ steps.cli.outputs.release }}
-    steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v3
-
-      - name: Parse .tool-versions
-        uses: wistia/parse-tool-versions@v2.1.1
-        with:
-          filename: '.tool-versions'
-          uppercase: 'true'
-          prefix: 'tool_version_'
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        id: pnpm-install
-        with:
-          version: '${{ env.TOOL_VERSION_PNPM }}'
-
-      - name: Setup Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: '${{ env.TOOL_VERSION_NODEJS }}'
-          registry-url: 'https://registry.npmjs.org'
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-
-      - name: Configure pnpm
-        run: |
-          pnpm config set auto-install-peers true
-          pnpm config set exclude-links-from-lockfile true
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Check JavasScript SDK Release
+      - name: Check JavaScript SDK Release
         id: js
+        if: steps.version.outputs.release == 'true'
         run: |
           IS_RELEASE=$(./.github/scripts/is_release_for_package.sh "e2b")
           echo "release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
 
       - name: Check Python SDK Release
         id: python
+        if: steps.version.outputs.release == 'true'
         run: |
           IS_RELEASE=$(./.github/scripts/is_release_for_package.sh "@e2b/python-sdk")
           echo "release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
 
       - name: Check CLI Release
         id: cli
+        if: steps.version.outputs.release == 'true'
         run: |
           IS_RELEASE=$(./.github/scripts/is_release_for_package.sh "@e2b/cli")
           echo "release=$IS_RELEASE" >> "$GITHUB_OUTPUT"
 
+      - name: Build release itinerary
+        id: itinerary
+        if: steps.version.outputs.release == 'true'
+        run: |
+          pnpm changeset status --output=.cs-status.json
+          ITINERARY=$(node -e '
+            const data = require("./.cs-status.json");
+            const labels = { "e2b": "JS SDK (e2b)", "@e2b/python-sdk": "Python SDK (e2b)", "@e2b/cli": "CLI (@e2b/cli)" };
+            const order = ["e2b", "@e2b/python-sdk", "@e2b/cli"];
+            const byName = Object.fromEntries(data.releases.map(r => [r.name, r]));
+            const lines = order.filter(n => byName[n]).map(n => `• ${labels[n]} v${byName[n].newVersion}`);
+            process.stdout.write(lines.join("\n") || "• No packages were published");
+          ')
+          rm -f .cs-status.json
+          {
+            echo "itinerary<<EOF"
+            echo "$ITINERARY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
   python-tests:
     name: Python SDK Tests
-    needs: [changes]
-    if: needs.changes.outputs.python-sdk == 'true'
+    needs: [preflight]
+    if: needs.preflight.outputs.python-sdk == 'true'
     uses: ./.github/workflows/python_sdk_tests.yml
     secrets: inherit
 
   js-tests:
     name: JS SDK Tests
-    needs: [changes]
-    if: needs.changes.outputs.js-sdk == 'true'
+    needs: [preflight]
+    if: needs.preflight.outputs.js-sdk == 'true'
     uses: ./.github/workflows/js_sdk_tests.yml
     secrets: inherit
 
   cli-tests:
     name: CLI Tests
-    needs: [changes]
-    if: needs.changes.outputs.cli == 'true'
+    needs: [preflight]
+    if: needs.preflight.outputs.cli == 'true'
     uses: ./.github/workflows/cli_tests.yml
     secrets: inherit
 
   publish:
     name: Publish
-    needs: [is_release, python-tests, js-tests, cli-tests]
-    if: (!cancelled()) && !contains(needs.*.result, 'failure') && needs.is_release.outputs.release == 'true'
+    needs: [preflight, python-tests, js-tests, cli-tests]
+    if: (!cancelled()) && !contains(needs.*.result, 'failure') && needs.preflight.outputs.release == 'true'
     uses: ./.github/workflows/publish_packages.yml
     secrets: inherit
+
+  report-start:
+    needs: [preflight]
+    if: needs.preflight.outputs.release == 'true'
+    name: Release Started - Slack Notification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release Started - Slack Notification
+        uses: rtCamp/action-slack-notify@33ca3be66c6f378fe1610fd1d5258632dbed5e58 # v2.4.0
+        env:
+          SLACK_COLOR: '#3aa3e3'
+          SLACK_MESSAGE: |
+            :rocket: A new release has been triggered :hourglass_flowing_sand:
+
+            *Releasing:*
+            ${{ needs.preflight.outputs.itinerary }}
+          SLACK_TITLE: Release Started
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: 'monitoring-releases'
 
   report-failure:
     needs: [python-tests, js-tests, cli-tests, publish]
@@ -149,10 +154,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Release Failed - Slack Notification
-        uses: rtCamp/action-slack-notify@v2
+        uses: rtCamp/action-slack-notify@33ca3be66c6f378fe1610fd1d5258632dbed5e58 # v2.4.0
         env:
           SLACK_COLOR: '#ff0000'
           SLACK_MESSAGE: ':here-we-go-again: :bob-the-destroyer: We need :fix-parrot: ASAP :pray:'
           SLACK_TITLE: Release Failed
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: 'monitoring-releases'
+
+  report-success:
+    needs: [preflight, publish]
+    if: (!cancelled()) && needs.publish.result == 'success'
+    name: Release Succeeded - Slack Notification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release Succeeded - Slack Notification
+        uses: rtCamp/action-slack-notify@33ca3be66c6f378fe1610fd1d5258632dbed5e58 # v2.4.0
+        env:
+          SLACK_COLOR: '#36a64f'
+          SLACK_MESSAGE: |
+            :tada: A new version has been released successfully! :ship-it-parrot:
+
+            *Released:*
+            ${{ needs.preflight.outputs.itinerary }}
+          SLACK_TITLE: Release Succeeded
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_CHANNEL: 'monitoring-releases'

@@ -1,24 +1,27 @@
 <p align="center">
-  <img width="100" src="https://raw.githubusercontent.com/e2b-dev/E2B/refs/heads/main/readme-assets/logo-circle.png" alt="e2b logo">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/e2b-dev/E2B/refs/heads/main/readme-assets/logo-white.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/e2b-dev/E2B/refs/heads/main/readme-assets/logo-black.png">
+    <img alt="E2B Logo" src="https://raw.githubusercontent.com/e2b-dev/E2B/refs/heads/main/readme-assets/logo-black.png" width="200">
+  </picture>
 </p>
 
 <h4 align="center">
   <a href="https://pypi.org/project/e2b/">
-    <img alt="Last 1 month downloads for the Python SDK" loading="lazy" width="200" height="20" decoding="async" data-nimg="1"
-    style="color:transparent;width:auto;height:100%" src="https://img.shields.io/pypi/dm/e2b?label=PyPI%20Downloads">
+    <img alt="Last 1 month downloads for the Python SDK" loading="lazy" decoding="async" style="color:transparent;width:170px;height:18px" src="https://static.pepy.tech/personalized-badge/e2b?period=monthly&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=PyPi%20Monthly%20Downloads">
   </a>  
 </h4>
 
 
 ## What is E2B?
-[E2B](https://www.e2b.dev/) is an open-source infrastructure that allows you to run AI-generated code in secure isolated sandboxes in the cloud. To start and control sandboxes, use our [JavaScript SDK](https://www.npmjs.com/package/@e2b/code-interpreter) or [Python SDK](https://pypi.org/project/e2b_code_interpreter).
+[E2B](https://www.e2b.dev/) is an open-source infrastructure that allows you to run AI-generated code in secure isolated sandboxes in the cloud. To start and control sandboxes, use our [JavaScript SDK](https://www.npmjs.com/package/e2b) or [Python SDK](https://pypi.org/project/e2b).
 
 ## Run your first Sandbox
 
 ### 1. Install SDK
 
 ```
-pip install e2b-code-interpreter
+pip install e2b
 ```
 
 ### 2. Get your E2B API key
@@ -27,21 +30,36 @@ pip install e2b-code-interpreter
 3. Set environment variable with your API key
 ```
 E2B_API_KEY=e2b_***
-```     
+```
 
-### 3. Execute code with code interpreter inside Sandbox
+### 3. Start a sandbox and run commands
+
+```py
+from e2b import Sandbox
+
+with Sandbox.create() as sandbox:
+    result = sandbox.commands.run('echo "Hello from E2B!"')
+    print(result.stdout)  # Hello from E2B!
+```
+
+### 4. Code execution with Code Interpreter
+
+If you need [`run_code()`](https://e2b.dev/docs/code-interpreting), install the [Code Interpreter SDK](https://github.com/e2b-dev/code-interpreter):
+
+```
+pip install e2b-code-interpreter
+```
 
 ```py
 from e2b_code_interpreter import Sandbox
 
 with Sandbox.create() as sandbox:
-    sandbox.run_code("x = 1")
-    execution = sandbox.run_code("x+=1; x")
+    execution = sandbox.run_code("x = 1; x += 1; x")
     print(execution.text)  # outputs 2
 ```
 
-### 4. Check docs
+### 5. Check docs
 Visit [E2B documentation](https://e2b.dev/docs).
 
-### 5. E2B cookbook
+### 6. E2B cookbook
 Visit our [Cookbook](https://github.com/e2b-dev/e2b-cookbook/tree/main) to get inspired by examples with different LLMs and AI frameworks.

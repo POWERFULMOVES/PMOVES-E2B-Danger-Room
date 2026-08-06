@@ -2,12 +2,14 @@ name: Test CLI
 
 on:
   workflow_call:
+    inputs:
+      E2B_DOMAIN:
+        required: false
+        type: string
+        default: ''
     secrets:
       E2B_API_KEY:
         required: true
-  pull_request:
-    branches:
-      - main
 
 permissions:
   contents: read
@@ -40,7 +42,7 @@ jobs:
           version: '${{ env.TOOL_VERSION_PNPM }}'
 
       - name: Setup Node
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v6
         with:
           node-version: '${{ env.TOOL_VERSION_NODEJS }}'
           registry-url: 'https://registry.npmjs.org'
@@ -67,3 +69,4 @@ jobs:
         working-directory: ./packages/cli
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          E2B_DOMAIN: ${{ inputs.E2B_DOMAIN }}

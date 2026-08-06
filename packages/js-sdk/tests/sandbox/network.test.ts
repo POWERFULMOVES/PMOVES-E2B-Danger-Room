@@ -1,13 +1,14 @@
 import { assert, expect, describe } from 'vitest'
 
-import { CommandExitError, ALL_TRAFFIC } from '../../src'
-import { sandboxTest, isDebug } from '../setup.js'
+import { CommandExitError, Sandbox } from '../../src'
+import { sandboxTest, isDebug, template } from '../setup.js'
+import { httpbinTemplate } from '../template.js'
 
 describe('allow only 1.1.1.1', () => {
-  sandboxTest.scoped({
+  sandboxTest.override({
     sandboxOpts: {
       network: {
-        denyOut: [ALL_TRAFFIC],
+        denyOut: ({ allTraffic }) => [allTraffic],
         allowOut: ['1.1.1.1'],
       },
     },
@@ -34,7 +35,7 @@ describe('allow only 1.1.1.1', () => {
 })
 
 describe('deny specific IP address', () => {
-  sandboxTest.scoped({
+  sandboxTest.override({
     sandboxOpts: {
       network: {
         denyOut: ['8.8.8.8'],
@@ -62,17 +63,17 @@ describe('deny specific IP address', () => {
   )
 })
 
-describe('deny all traffic using allTraffic helper', () => {
-  sandboxTest.scoped({
+describe('deny all traffic using allTraffic selector', () => {
+  sandboxTest.override({
     sandboxOpts: {
       network: {
-        denyOut: [ALL_TRAFFIC],
+        denyOut: ({ allTraffic }) => [allTraffic],
       },
     },
   })
 
   sandboxTest.skipIf(isDebug)(
-    'deny all traffic using allTraffic helper',
+    'deny all traffic using allTraffic selector',
     async ({ sandbox }) => {
       // Test that all traffic is denied
       await expect(
@@ -91,10 +92,10 @@ describe('deny all traffic using allTraffic helper', () => {
 })
 
 describe('allow takes precedence over deny', () => {
-  sandboxTest.scoped({
+  sandboxTest.override({
     sandboxOpts: {
       network: {
-        denyOut: [ALL_TRAFFIC],
+        denyOut: ({ allTraffic }) => [allTraffic],
         allowOut: ['1.1.1.1', '8.8.8.8'],
       },
     },
@@ -121,7 +122,7 @@ describe('allow takes precedence over deny', () => {
 })
 
 describe('allowPublicTraffic=false', () => {
-  sandboxTest.scoped({
+  sandboxTest.override({
     sandboxOpts: {
       network: {
         allowPublicTraffic: false,
@@ -163,7 +164,7 @@ describe('allowPublicTraffic=false', () => {
 })
 
 describe('allowPublicTraffic=true', () => {
-  sandboxTest.scoped({
+  sandboxTest.override({
     sandboxOpts: {
       network: {
         allowPublicTraffic: true,
@@ -193,8 +194,134 @@ describe('allowPublicTraffic=true', () => {
   )
 })
 
+describe('firewall transform injects headers', () => {
+  const injectedHeader = 'X-Test-Token'
+  const injectedValue = 'e2b-transform-value-123'
+  // Port the httpbin template's start command listens on.
+  const httpbinPort = 8080
+
+  sandboxTest.skipIf(isDebug)(
+    'injected header is reflected by the httpbin sidecar',
+    async ({ sandboxTestId }) => {
+      // The transform is applied by the egress proxy on the way out of the
+      // sandbox, so the target has to be reachable from the public internet —
+      // a CI service container would not be. A sidecar sandbox running the
+      // httpbin template is that target, which keeps the test off any
+      // externally hosted service. Its ready command has already passed by the
+      // time create resolves, so the server is serving.
+      const httpbin = await Sandbox.create(httpbinTemplate, {
+        metadata: { sandboxTestId },
+        network: { allowPublicTraffic: true },
+      })
+      let sandbox: Sandbox | undefined
+
+      try {
+        const httpbinHost = httpbin.getHost(httpbinPort)
+
+        sandbox = await Sandbox.create(template, {
+          metadata: { sandboxTestId },
+          network: {
+            rules: {
+              [httpbinHost]: [
+                {
+                  transform: {
+                    headers: {
+                      [injectedHeader]: injectedValue,
+                    },
+                  },
+                },
+              ],
+            },
+          },
+        })
+
+        const result = await sandbox.commands.run(
+          `curl -sS --retry 5 --retry-connrefused --max-time 10 https://${httpbinHost}/headers`
+        )
+        assert.equal(result.exitCode, 0)
+
+        const parsed = JSON.parse(result.stdout) as {
+          headers: Record<string, string[]>
+        }
+        const reflected = parsed.headers[injectedHeader]
+        assert.deepEqual(
+          reflected,
+          [injectedValue],
+          `expected httpbin to reflect ${injectedHeader}=${injectedValue}, got headers: ${JSON.stringify(parsed.headers)}`
+        )
+      } finally {
+        await Promise.allSettled([sandbox?.kill(), httpbin.kill()])
+      }
+    }
+  )
+})
+
+describe('updateNetwork applies new egress rules', () => {
+  sandboxTest.skipIf(isDebug)(
+    'denies a previously reachable IP after update',
+    async ({ sandbox }) => {
+      // Baseline: 8.8.8.8 is reachable.
+      const before = await sandbox.commands.run(
+        "curl -s -o /dev/null -w '%{http_code}' https://8.8.8.8"
+      )
+      assert.equal(before.exitCode, 0)
+
+      await sandbox.updateNetwork({ denyOut: ['8.8.8.8'] })
+
+      // 8.8.8.8 should now be denied.
+      await expect(
+        sandbox.commands.run(
+          'curl --connect-timeout 3 --max-time 5 -Is https://8.8.8.8'
+        )
+      ).rejects.toBeInstanceOf(CommandExitError)
+
+      // Other destinations stay reachable.
+      const after = await sandbox.commands.run(
+        "curl -s -o /dev/null -w '%{http_code}' https://1.1.1.1"
+      )
+      assert.equal(after.exitCode, 0)
+    }
+  )
+})
+
+describe('updateNetwork clears existing rules when fields are omitted', () => {
+  sandboxTest.override({
+    sandboxOpts: {
+      network: {
+        denyOut: ({ allTraffic }) => [allTraffic],
+        allowOut: ['1.1.1.1'],
+      },
+    },
+  })
+
+  sandboxTest.skipIf(isDebug)(
+    'omitting fields replaces all egress rules',
+    async ({ sandbox }) => {
+      // Baseline from create-time config: 8.8.8.8 denied.
+      await expect(
+        sandbox.commands.run(
+          'curl --connect-timeout 3 --max-time 5 -Is https://8.8.8.8'
+        )
+      ).rejects.toBeInstanceOf(CommandExitError)
+
+      // Empty update clears allow_out / deny_out entirely.
+      await sandbox.updateNetwork({})
+
+      const r1 = await sandbox.commands.run(
+        "curl -s -o /dev/null -w '%{http_code}' https://1.1.1.1"
+      )
+      assert.equal(r1.exitCode, 0)
+
+      const r2 = await sandbox.commands.run(
+        "curl -s -o /dev/null -w '%{http_code}' https://8.8.8.8"
+      )
+      assert.equal(r2.exitCode, 0)
+    }
+  )
+})
+
 describe('maskRequestHost option', () => {
-  sandboxTest.scoped({
+  sandboxTest.override({
     sandboxOpts: {
       network: {
         maskRequestHost: 'custom-host.example.com:${PORT}',
@@ -205,23 +332,27 @@ describe('maskRequestHost option', () => {
   sandboxTest.skipIf(isDebug)(
     'verify maskRequestHost modifies Host header correctly',
     async ({ sandbox }) => {
-      // Install netcat for testing
-      await sandbox.commands.run('apt-get update', { user: 'root' })
-      await sandbox.commands.run('apt-get install -y netcat-traditional', {
-        user: 'root',
-      })
-
       const port = 8080
-      const outputFile = '/tmp/nc_output.txt'
+      const outputFile = '/tmp/headers.txt'
 
-      // Start netcat listener in background to capture request headers
-      sandbox.commands.run(`nc -l -p ${port} > ${outputFile}`, {
-        background: true,
-        user: 'root',
-      })
+      // Start a Python HTTP server that captures request headers and writes them to a file
+      sandbox.commands.run(
+        `python3 -c "
+import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open('${outputFile}', 'w') as f:
+            for k, v in self.headers.items():
+                f.write(k + ': ' + v + chr(10))
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer(('', ${port}), H).handle_request()
+"`,
+        { background: true }
+      )
 
-      // Wait for netcat to start
-      await new Promise((resolve) => setTimeout(resolve, 3000))
+      await new Promise((resolve) => setTimeout(resolve, 2000))
 
       // Get the public URL for the sandbox
       const sandboxUrl = `https://${sandbox.getHost(port)}`
@@ -231,13 +362,13 @@ describe('maskRequestHost option', () => {
       try {
         await fetch(sandboxUrl, { signal: AbortSignal.timeout(5000) })
       } catch (error) {
-        // Request may fail since netcat doesn't respond properly, but headers are captured
+        // Request may timeout, but headers are captured by the server
       }
 
-      // Read the captured output from inside the sandbox
-      const result = await sandbox.commands.run(`cat ${outputFile}`, {
-        user: 'root',
-      })
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+
+      // Read the captured headers from inside the sandbox
+      const result = await sandbox.commands.run(`cat ${outputFile}`)
 
       // Verify the Host header was modified according to maskRequestHost
       assert.include(result.stdout, 'Host:')

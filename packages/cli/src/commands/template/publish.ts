@@ -11,21 +11,22 @@ import {
 } from 'src/utils/format'
 import {
   configOption,
+  deprecatedTeamOption,
   pathOption,
+  projectIdFromOptions,
+  projectOption,
   selectMultipleOption,
-  teamOption,
 } from 'src/options'
 import { configName, E2BConfig, getConfigPath, loadConfig } from 'src/config'
 import { getRoot } from 'src/utils/filesystem'
 import { listSandboxTemplates } from './list'
 import { getPromptTemplates } from 'src/utils/templatePrompt'
 import { confirm } from 'src/utils/confirm'
-import { client } from 'src/api'
+import { client, resolveProjectId } from 'src/api'
 import { handleE2BRequestError } from '../../utils/errors'
-import { getUserConfig } from 'src/user'
 
 async function publishTemplate(templateID: string, publish: boolean) {
-  const res = await client.api.PATCH('/templates/{templateID}', {
+  const res = await client.api.PATCH('/v2/templates/{templateID}', {
     params: {
       path: {
         templateID,
@@ -40,7 +41,8 @@ async function publishTemplate(templateID: string, publish: boolean) {
     res,
     `Error ${publish ? 'publishing' : 'unpublishing'} sandbox template`
   )
-  return
+
+  return res.data?.names ?? []
 }
 
 async function templateAction(
@@ -51,11 +53,12 @@ async function templateAction(
     config?: string
     yes?: boolean
     select?: boolean
+    project?: string
     team?: string
   }
 ) {
   try {
-    let teamId = opts.team
+    let projectId = projectIdFromOptions(opts)
 
     const root = getRoot(opts.path)
 
@@ -68,13 +71,10 @@ async function templateAction(
         template_id: template,
       })
     } else if (opts.select) {
-      const userConfig = getUserConfig()
-      if (userConfig) {
-        teamId = teamId || userConfig.teamId
-      }
+      projectId = resolveProjectId(projectId)
 
       const allTemplates = await listSandboxTemplates({
-        teamID: teamId,
+        projectId,
       })
 
       const filteredTemplates = allTemplates.filter(
@@ -160,8 +160,8 @@ async function templateAction(
           templates.length === 1 ? 'template' : 'templates'
         } ${
           publish
-            ? 'public to everyone outside your team'
-            : 'private to your team'
+            ? 'public to everyone outside your project'
+            : 'private to your project'
         }`
       )
 
@@ -181,7 +181,10 @@ async function templateAction(
             e.configPath
           )}`
         )
-        await publishTemplate(e.template_id, publish)
+        const names = await publishTemplate(e.template_id, publish)
+        if (publish && names.length > 0) {
+          console.log(`  Published as: ${asBold(names.join(', '))}`)
+        }
       })
     )
     process.stdout.write('\n')
@@ -206,7 +209,8 @@ export const publishCommand = new commander.Command('publish')
   .addOption(pathOption)
   .addOption(configOption)
   .addOption(selectMultipleOption)
-  .addOption(teamOption)
+  .addOption(projectOption)
+  .addOption(deprecatedTeamOption)
   .alias('pb')
   .option('-y, --yes', 'skip manual publish confirmation')
   .action(templateAction.bind(null, true))
@@ -226,7 +230,8 @@ export const unPublishCommand = new commander.Command('unpublish')
   .addOption(pathOption)
   .addOption(configOption)
   .addOption(selectMultipleOption)
-  .addOption(teamOption)
+  .addOption(projectOption)
+  .addOption(deprecatedTeamOption)
   .alias('upb')
   .option('-y, --yes', 'skip manual unpublish confirmation')
   .action(templateAction.bind(null, false))

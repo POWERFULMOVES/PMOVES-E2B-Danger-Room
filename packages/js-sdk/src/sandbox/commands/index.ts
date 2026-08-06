@@ -12,15 +12,24 @@ import {
   ConnectionOpts,
   KEEPALIVE_PING_HEADER,
   KEEPALIVE_PING_INTERVAL_SEC,
+  setupRequestController,
   Username,
 } from '../../connectionConfig'
-import { handleProcessStartEvent } from '../../envd/api'
+import {
+  checkSandboxHealth,
+  EnvdApiClient,
+  handleProcessStartEvent,
+} from '../../envd/api'
 import {
   Process as ProcessService,
   Signal,
 } from '../../envd/process/process_pb'
-import { authenticationHeader, handleRpcError } from '../../envd/rpc'
-import { ENVD_COMMANDS_STDIN } from '../../envd/versions'
+import {
+  authenticationHeader,
+  handleRpcErrorWithHealthCheck,
+  SandboxHealthCheck,
+} from '../../envd/rpc'
+import { ENVD_COMMANDS_STDIN, ENVD_ENVD_CLOSE } from '../../envd/versions'
 import { SandboxError } from '../../errors'
 import { CommandHandle, CommandResult } from './commandHandle'
 export { Pty } from './pty'
@@ -29,7 +38,7 @@ export { Pty } from './pty'
  * Options for sending a command request.
  */
 export interface CommandRequestOpts
-  extends Partial<Pick<ConnectionOpts, 'requestTimeoutMs'>> {}
+  extends Partial<Pick<ConnectionOpts, 'requestTimeoutMs' | 'signal'>> {}
 
 /**
  * Options for starting a new command.
@@ -128,16 +137,24 @@ export class Commands {
 
   private readonly defaultProcessConnectionTimeout = 60_000 // 60 seconds
   private readonly envdVersion: string
+  private readonly checkHealth: SandboxHealthCheck
 
   constructor(
     transport: Transport,
-    private readonly connectionConfig: ConnectionConfig,
-    metadata: {
-      version: string
-    }
+    private readonly envdApi: EnvdApiClient,
+    private readonly connectionConfig: ConnectionConfig
   ) {
     this.rpc = createClient(ProcessService, transport)
-    this.envdVersion = metadata.version
+    this.envdVersion = envdApi.version
+    this.checkHealth = () => checkSandboxHealth(this.envdApi)
+  }
+
+  /**
+   * @hidden
+   * @internal
+   */
+  get supportsStdinClose(): boolean {
+    return compareVersions(this.envdVersion, ENVD_ENVD_CLOSE) >= 0
   }
 
   /**
@@ -152,7 +169,10 @@ export class Commands {
       const res = await this.rpc.list(
         {},
         {
-          signal: this.connectionConfig.getSignal(opts?.requestTimeoutMs),
+          signal: this.connectionConfig.getSignal(
+            opts?.requestTimeoutMs,
+            opts?.signal
+          ),
         }
       )
 
@@ -165,7 +185,7 @@ export class Commands {
         ...(p.config!.cwd && { cwd: p.config!.cwd }),
       }))
     } catch (err) {
-      throw handleRpcError(err)
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
@@ -178,10 +198,13 @@ export class Commands {
    */
   async sendStdin(
     pid: number,
-    data: string,
+    data: string | Uint8Array,
     opts?: CommandRequestOpts
   ): Promise<void> {
     try {
+      const payload =
+        typeof data === 'string' ? new TextEncoder().encode(data) : data
+
       await this.rpc.sendInput(
         {
           process: {
@@ -193,16 +216,56 @@ export class Commands {
           input: {
             input: {
               case: 'stdin',
-              value: new TextEncoder().encode(data),
+              value: payload,
             },
           },
         },
         {
-          signal: this.connectionConfig.getSignal(opts?.requestTimeoutMs),
+          signal: this.connectionConfig.getSignal(
+            opts?.requestTimeoutMs,
+            opts?.signal
+          ),
         }
       )
     } catch (err) {
-      throw handleRpcError(err)
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
+    }
+  }
+
+  /**
+   * Close command stdin.
+   *
+   * This signals EOF to the command. The command must have been started with `stdin: true`.
+   *
+   * @param pid process ID of the command. You can get the list of running commands using {@link Commands.list}.
+   * @param opts connection options.
+   */
+  async closeStdin(pid: number, opts?: CommandRequestOpts): Promise<void> {
+    if (!this.supportsStdinClose) {
+      throw new SandboxError(
+        `Sandbox envd version ${this.envdVersion} doesn't support closeStdin. Please rebuild your template to pick up the latest sandbox version.`
+      )
+    }
+
+    try {
+      await this.rpc.closeStdin(
+        {
+          process: {
+            selector: {
+              case: 'pid',
+              value: pid,
+            },
+          },
+        },
+        {
+          signal: this.connectionConfig.getSignal(
+            opts?.requestTimeoutMs,
+            opts?.signal
+          ),
+        }
+      )
+    } catch (err) {
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
@@ -228,7 +291,10 @@ export class Commands {
           signal: Signal.SIGKILL,
         },
         {
-          signal: this.connectionConfig.getSignal(opts?.requestTimeoutMs),
+          signal: this.connectionConfig.getSignal(
+            opts?.requestTimeoutMs,
+            opts?.signal
+          ),
         }
       )
 
@@ -240,7 +306,7 @@ export class Commands {
         }
       }
 
-      throw handleRpcError(err)
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
@@ -260,13 +326,10 @@ export class Commands {
     const requestTimeoutMs =
       opts?.requestTimeoutMs ?? this.connectionConfig.requestTimeoutMs
 
-    const controller = new AbortController()
-
-    const reqTimeout = requestTimeoutMs
-      ? setTimeout(() => {
-          controller.abort()
-        }, requestTimeoutMs)
-      : undefined
+    const { controller, clearStartTimeout, cleanup } = setupRequestController(
+      requestTimeoutMs,
+      opts?.signal
+    )
 
     const events = this.rpc.connect(
       {
@@ -288,20 +351,23 @@ export class Commands {
 
     try {
       const pid = await handleProcessStartEvent(events)
-
-      clearTimeout(reqTimeout)
+      clearStartTimeout()
 
       return new CommandHandle(
         pid,
-        () => controller.abort(),
+        cleanup,
         () => this.kill(pid),
         events,
         opts?.onStdout,
         opts?.onStderr,
-        undefined
+        undefined,
+        (data, stdinOpts) => this.sendStdin(pid, data, stdinOpts),
+        (stdinOpts) => this.closeStdin(pid, stdinOpts),
+        this.checkHealth
       )
     } catch (err) {
-      throw handleRpcError(err)
+      cleanup()
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 
@@ -361,17 +427,6 @@ export class Commands {
     cmd: string,
     opts?: CommandStartOpts
   ): Promise<CommandHandle> {
-    const requestTimeoutMs =
-      opts?.requestTimeoutMs ?? this.connectionConfig.requestTimeoutMs
-
-    const controller = new AbortController()
-
-    const reqTimeout = requestTimeoutMs
-      ? setTimeout(() => {
-          controller.abort()
-        }, requestTimeoutMs)
-      : undefined
-
     if (
       opts?.stdin === false &&
       compareVersions(this.envdVersion, ENVD_COMMANDS_STDIN) < 0
@@ -380,6 +435,14 @@ export class Commands {
         `Sandbox envd version ${this.envdVersion} can't specify stdin, it's always turned on. Please rebuild your template if you need this feature.`
       )
     }
+
+    const requestTimeoutMs =
+      opts?.requestTimeoutMs ?? this.connectionConfig.requestTimeoutMs
+
+    const { controller, clearStartTimeout, cleanup } = setupRequestController(
+      requestTimeoutMs,
+      opts?.signal
+    )
 
     const events = this.rpc.start(
       {
@@ -403,20 +466,23 @@ export class Commands {
 
     try {
       const pid = await handleProcessStartEvent(events)
-
-      clearTimeout(reqTimeout)
+      clearStartTimeout()
 
       return new CommandHandle(
         pid,
-        () => controller.abort(),
+        cleanup,
         () => this.kill(pid),
         events,
         opts?.onStdout,
         opts?.onStderr,
-        undefined
+        undefined,
+        (data, stdinOpts) => this.sendStdin(pid, data, stdinOpts),
+        (stdinOpts) => this.closeStdin(pid, stdinOpts),
+        this.checkHealth
       )
     } catch (err) {
-      throw handleRpcError(err)
+      cleanup()
+      throw await handleRpcErrorWithHealthCheck(err, this.checkHealth)
     }
   }
 }

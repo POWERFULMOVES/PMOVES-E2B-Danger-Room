@@ -1,23 +1,30 @@
 name: Build and push prepared templates
 
 on:
-  push:
-    paths:
-      - 'templates/**'
-      - '.github/workflows/templates.yml'
-    branches:
-      - main
+  workflow_dispatch:
+    inputs:
+      template:
+        description: 'Template to build'
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - base
+          - httpbin
 
 permissions:
   contents: read
 
 jobs:
-  buildAndPublish:
+  buildAndPushImage:
+    # Only the base template has a DockerHub counterpart.
+    if: ${{ inputs.template == 'all' || inputs.template == 'base' }}
     defaults:
       run:
         working-directory: ./templates/base
 
-    name: Build and Push Images
+    name: Build and Push Image to DockerHub
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
@@ -36,6 +43,38 @@ jobs:
         run: |
           docker buildx build \
             --file e2b.Dockerfile \
-            --platform linux/amd64 \
+            --platform linux/amd64,linux/arm64 \
             --push \
             --tag ${{ secrets.DOCKERHUB_USERNAME }}/base:latest .
+
+  buildTemplate:
+    name: Build and Publish E2B Template
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build and install E2B CLI
+        uses: ./.github/actions/build-cli
+
+      - name: Build and publish base template
+        if: ${{ inputs.template == 'all' || inputs.template == 'base' }}
+        working-directory: ./templates/base
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+        run: e2b template create base --memory-mb 512
+
+      # Sidecar the network transform tests spawn as a publicly reachable echo
+      # server. Stays private to the E2B team, like the base template — the
+      # tests that use it need our API key anyway. The ready command doubles as
+      # the build-time smoke test: the build only finishes once go-httpbin
+      # answers on the port the tests connect to.
+      - name: Build httpbin template
+        if: ${{ inputs.template == 'all' || inputs.template == 'httpbin' }}
+        working-directory: ./templates/httpbin
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+        run: |
+          e2b template create httpbin --memory-mb 512 \
+            --cmd 'go-httpbin -host 0.0.0.0 -port 8080' \
+            --ready-cmd 'curl -fsS http://localhost:8080/status/200 > /dev/null'

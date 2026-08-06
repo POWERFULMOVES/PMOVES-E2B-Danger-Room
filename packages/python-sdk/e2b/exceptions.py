@@ -10,12 +10,6 @@ def format_request_timeout_error() -> Exception:
     )
 
 
-def format_execution_timeout_error() -> Exception:
-    return TimeoutException(
-        "Execution timed out — the 'timeout' option can be used to increase this timeout",
-    )
-
-
 class SandboxException(Exception):
     """
     Base class for all sandbox errors.
@@ -58,6 +52,26 @@ class NotEnoughSpaceException(SandboxException):
 class NotFoundException(SandboxException):
     """
     Raised when a resource is not found.
+
+    .. deprecated::
+        Use :class:`FileNotFoundException` or :class:`SandboxNotFoundException` instead.
+        This class will be removed in the next major version.
+    """
+
+    pass
+
+
+class FileNotFoundException(NotFoundException):
+    """
+    Raised when a file or directory is not found inside a sandbox.
+    """
+
+    pass
+
+
+class SandboxNotFoundException(NotFoundException):
+    """
+    Raised when a sandbox is not found (e.g. it doesn't exist or is no longer running).
     """
 
     pass
@@ -66,6 +80,22 @@ class NotFoundException(SandboxException):
 class AuthenticationException(Exception):
     """
     Raised when authentication fails.
+    """
+
+    pass
+
+
+class GitAuthException(AuthenticationException):
+    """
+    Raised when git authentication fails.
+    """
+
+    pass
+
+
+class GitUpstreamException(SandboxException):
+    """
+    Raised when git upstream tracking is missing.
     """
 
     pass
@@ -92,4 +122,12 @@ class BuildException(Exception):
 class FileUploadException(BuildException):
     """
     Raised when the file upload fails.
+    """
+
+
+class VolumeException(Exception):
+    """
+    Base class for all volume errors.
+
+    Raised when general volume errors occur.
     """

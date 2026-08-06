@@ -25,8 +25,13 @@ export type TemplateOptions = {
 export type BasicBuildOptions = {
   /**
    * Alias name for the template.
+   * @deprecated Use the `name` parameter of `Template.build()` instead.
    */
   alias: string
+  /**
+   * Tags to assign to the template build.
+   */
+  tags?: string[]
   /**
    * Number of CPUs allocated to the sandbox.
    * @default 2
@@ -57,20 +62,119 @@ export type BuildOptions = ConnectionOpts & BasicBuildOptions
  * Information about a built template.
  */
 export type BuildInfo = {
+  /**
+   * First alias from the build (for backward compatibility).
+   * @deprecated Use `name` instead.
+   */
   alias: string
+  /**
+   * Name of the template.
+   */
+  name: string
+  /**
+   * Tags assigned to this build.
+   */
+  tags: string[]
+  /**
+   * Template identifier.
+   */
   templateId: string
+  /**
+   * Build identifier.
+   */
   buildId: string
+}
+
+/**
+ * Options for getting build status.
+ */
+export type GetBuildStatusOptions = ConnectionOpts & { logsOffset?: number }
+
+/**
+ * Status of a template build.
+ */
+export type TemplateBuildStatus = 'building' | 'waiting' | 'ready' | 'error'
+
+/**
+ * Reason for the current build status (typically for errors).
+ */
+export type BuildStatusReason = {
+  /**
+   * Message with the status reason.
+   */
+  message: string
+  /**
+   * Step that failed.
+   */
+  step?: string
+  /**
+   * Log entries related to the status reason.
+   */
+  logEntries: LogEntry[]
 }
 
 /**
  * Response from getting build status.
  */
-export type GetBuildStatusOptions = ConnectionOpts & { logsOffset?: number }
+export type TemplateBuildStatusResponse = {
+  /**
+   * Build identifier.
+   */
+  buildID: string
+  /**
+   * Template identifier.
+   */
+  templateID: string
+  /**
+   * Current status of the build.
+   */
+  status: TemplateBuildStatus
+  /**
+   * Build log entries.
+   */
+  logEntries: LogEntry[]
+  /**
+   * Build logs (raw strings).
+   * @deprecated Use `logEntries` instead.
+   */
+  logs: string[]
+  /**
+   * Reason for the current status (typically for errors).
+   */
+  reason?: BuildStatusReason
+}
 
 /**
- * Options for checking if a template alias exists.
+ * Information about assigned template tags.
  */
-export type AliasExistsOptions = ConnectionOpts
+export type TemplateTagInfo = {
+  /**
+   * Build identifier associated with this tag.
+   */
+  buildId: string
+  /**
+   * Assigned tags of the template.
+   */
+  tags: string[]
+}
+
+/**
+ * Detailed information about a single template tag.
+ */
+export type TemplateTag = {
+  /**
+   * Name of the tag.
+   */
+  tag: string
+  /**
+   * Build identifier associated with this tag.
+   */
+  buildId: string
+  /**
+   * When this tag was assigned.
+   */
+  createdAt: Date
+}
 
 /**
  * Types of instructions that can be used in a template.
@@ -93,6 +197,7 @@ export type Instruction = {
   forceUpload?: true
   filesHash?: string
   resolveSymlinks?: boolean
+  gzip?: boolean
 }
 
 /**
@@ -105,6 +210,7 @@ export type CopyItem = {
   user?: string
   mode?: number
   resolveSymlinks?: boolean
+  gzip?: boolean
 }
 
 /**
@@ -138,6 +244,42 @@ export interface TemplateFromImage {
    * ```
    */
   fromUbuntuImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from a Fedora-based Docker image.
+   * @param variant Fedora variant (default: '44')
+   *
+   * @example
+   * ```ts
+   * Template().fromFedoraImage('44')
+   * ```
+   */
+  fromFedoraImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from an Alpine-based Docker image.
+   * @param variant Alpine variant (default: '3.24')
+   *
+   * @example
+   * ```ts
+   * Template().fromAlpineImage('3.24')
+   * ```
+   */
+  fromAlpineImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from an Arch Linux-based Docker image.
+   *
+   * Defaults to `latest`: Arch is a rolling release and template provisioning
+   * runs `pacman -Syu`, so pinning a tag would not change the built result.
+   * @param variant Arch Linux variant (default: 'latest')
+   *
+   * @example
+   * ```ts
+   * Template().fromArchImage('base-devel')
+   * ```
+   */
+  fromArchImage(variant?: string): TemplateBuilder
 
   /**
    * Start from a Python-based Docker image.
@@ -308,6 +450,7 @@ export interface TemplateBuilder {
       user?: string
       mode?: number
       resolveSymlinks?: boolean
+      gzip?: boolean
     }
   ): TemplateBuilder
 
@@ -513,11 +656,12 @@ export interface TemplateBuilder {
    * template.aptInstall('vim')
    * template.aptInstall(['git', 'curl', 'wget'])
    * template.aptInstall(['vim'], { noInstallRecommends: true })
+   * template.aptInstall(['vim'], { fixMissing: true })
    * ```
    */
   aptInstall(
     packages: string | string[],
-    options?: { noInstallRecommends?: boolean }
+    options?: { noInstallRecommends?: boolean; fixMissing?: boolean }
   ): TemplateBuilder
 
   /**

@@ -1,6 +1,10 @@
-import { handleRpcError } from '../../envd/rpc'
+import {
+  handleRpcErrorWithHealthCheck,
+  SandboxHealthCheck,
+} from '../../envd/rpc'
 import { SandboxError } from '../../errors'
 import { ConnectResponse, StartResponse } from '../../envd/process/process_pb'
+import type { CommandRequestOpts } from '.'
 
 declare const __brand: unique symbol
 type Brand<B> = { [__brand]: B }
@@ -87,8 +91,13 @@ export class CommandHandle
   private _stdout = ''
   private _stderr = ''
 
+  private readonly stdoutDecoder = new TextDecoder()
+  private readonly stderrDecoder = new TextDecoder()
+
   private result?: CommandResult
   private iterationError?: Error
+
+  private disconnected = false
 
   private readonly _wait: Promise<void>
 
@@ -104,7 +113,15 @@ export class CommandHandle
     private readonly events: AsyncIterable<ConnectResponse | StartResponse>,
     private readonly onStdout?: (stdout: string) => void | Promise<void>,
     private readonly onStderr?: (stderr: string) => void | Promise<void>,
-    private readonly onPty?: (pty: Uint8Array) => void | Promise<void>
+    private readonly onPty?: (pty: Uint8Array) => void | Promise<void>,
+    private readonly handleSendStdin?: (
+      data: string | Uint8Array,
+      opts?: CommandRequestOpts
+    ) => Promise<void>,
+    private readonly handleCloseStdin?: (
+      opts?: CommandRequestOpts
+    ) => Promise<void>,
+    private readonly checkHealth?: SandboxHealthCheck
   ) {
     this._wait = this.handleEvents()
   }
@@ -169,8 +186,14 @@ export class CommandHandle
    *
    * The command is not killed, but SDK stops receiving events from the command.
    * You can reconnect to the command using {@link Commands.connect}.
+   *
+   * Once it returns, the `onStdout`/`onStderr`/`onPty` callbacks are guaranteed
+   * not to fire for output produced after this call. It does not wait for the
+   * event handler to drain, so it returns promptly even for an idle command
+   * whose stream produces no further output.
    */
   async disconnect() {
+    this.disconnected = true
     this.handleDisconnect()
   }
 
@@ -184,57 +207,169 @@ export class CommandHandle
     return await this.handleKill()
   }
 
+  /**
+   * Send data to the command stdin.
+   *
+   * The command must have been started with `stdin: true`.
+   *
+   * @param data data to send to the command.
+   * @param opts connection options.
+   */
+  async sendStdin(
+    data: string | Uint8Array,
+    opts?: CommandRequestOpts
+  ): Promise<void> {
+    if (!this.handleSendStdin) {
+      throw new SandboxError(
+        'Sending stdin is not supported for this command handle.'
+      )
+    }
+
+    await this.handleSendStdin(data, opts)
+  }
+
+  /**
+   * Close the command stdin.
+   *
+   * This signals EOF to the command. The command must have been started with
+   * `stdin: true`.
+   *
+   * @param opts connection options.
+   */
+  async closeStdin(opts?: CommandRequestOpts): Promise<void> {
+    if (!this.handleCloseStdin) {
+      throw new SandboxError(
+        'Closing stdin is not supported for this command handle.'
+      )
+    }
+
+    await this.handleCloseStdin(opts)
+  }
+
+  /**
+   * Flush any bytes still buffered in the stream decoders.
+   *
+   * Incomplete trailing UTF-8 sequences are emitted as replacement
+   * characters, matching the per-chunk decoding behavior.
+   */
+  private *flushDecoders(): Generator<
+    [Stdout, null, null] | [null, Stderr, null]
+  > {
+    const stdoutRest = this.stdoutDecoder.decode()
+    if (stdoutRest) {
+      this._stdout += stdoutRest
+      yield [stdoutRest as Stdout, null, null]
+    }
+    const stderrRest = this.stderrDecoder.decode()
+    if (stderrRest) {
+      this._stderr += stderrRest
+      yield [null, stderrRest as Stderr, null]
+    }
+  }
+
   private async *iterateEvents(): AsyncGenerator<
     [Stdout, null, null] | [null, Stderr, null] | [null, null, PtyOutput]
   > {
-    for await (const event of this.events) {
-      const e = event?.event?.event
-      let out: string | undefined
+    try {
+      for await (const event of this.events) {
+        const e = event?.event?.event
+        let out: string | undefined
 
-      switch (e?.case) {
-        case 'data':
-          switch (e.value.output.case) {
-            case 'stdout':
-              out = new TextDecoder().decode(e.value.output.value)
-              this._stdout += out
-              yield [out as Stdout, null, null]
-              break
-            case 'stderr':
-              out = new TextDecoder().decode(e.value.output.value)
-              this._stderr += out
-              yield [null, out as Stderr, null]
-              break
-            case 'pty':
-              yield [null, null, e.value.output.value as PtyOutput]
-              break
+        switch (e?.case) {
+          case 'data':
+            switch (e.value.output.case) {
+              case 'stdout':
+                out = this.stdoutDecoder.decode(e.value.output.value, {
+                  stream: true,
+                })
+                if (out) {
+                  this._stdout += out
+                  yield [out as Stdout, null, null]
+                }
+                break
+              case 'stderr':
+                out = this.stderrDecoder.decode(e.value.output.value, {
+                  stream: true,
+                })
+                if (out) {
+                  this._stderr += out
+                  yield [null, out as Stderr, null]
+                }
+                break
+              case 'pty':
+                yield [null, null, e.value.output.value as PtyOutput]
+                break
+            }
+            break
+          case 'end': {
+            // Flush trailing decoder bytes into the accumulators and record the
+            // result *before* yielding the flushed chunks. A disconnected
+            // consumer breaks out of `handleEvents` on the first yielded chunk,
+            // which would otherwise abort this generator before `this.result`
+            // is assigned and make `wait()` fail as if the process never
+            // produced a result.
+            const flushed = [...this.flushDecoders()]
+            this.result = {
+              exitCode: e.value.exitCode,
+              error: e.value.error,
+              stdout: this.stdout,
+              stderr: this.stderr,
+            }
+            for (const chunk of flushed) {
+              yield chunk
+            }
+            break
           }
-          break
-        case 'end':
-          this.result = {
-            exitCode: e.value.exitCode,
-            error: e.value.error,
-            stdout: this.stdout,
-            stderr: this.stderr,
-          }
-          break
+        }
+        // TODO: Handle empty events like in python SDK
       }
-      // TODO: Handle empty events like in python SDK
+    } catch (e) {
+      // The stream raised before an `end` event (e.g. disconnect or RPC
+      // failure). Flush any bytes still buffered in the decoders so incomplete
+      // trailing sequences surface as replacement characters instead of being
+      // silently dropped, then re-raise so the error is still surfaced.
+      yield* this.flushDecoders()
+      throw e
+    }
+
+    // If the stream closed without an `end` event (e.g. disconnect or a
+    // dropped connection), flush any bytes still buffered in the decoders so
+    // incomplete trailing sequences surface as replacement characters instead
+    // of being silently dropped.
+    if (this.result === undefined) {
+      yield* this.flushDecoders()
     }
   }
 
   private async handleEvents() {
     try {
       for await (const [stdout, stderr, pty] of this.iterateEvents()) {
+        // The handle was disconnected — stop dispatching to the callbacks. The
+        // flag is checked before every dispatch, so no callback fires for
+        // output that arrives (or was buffered) after disconnect() was called,
+        // even if the underlying abort hasn't torn the stream down yet. There
+        // is no synchronous suspension point between this check and the
+        // dispatch below, so disconnect() cannot interleave to let a late event
+        // slip through.
+        if (this.disconnected) {
+          break
+        }
+
         if (stdout !== null) {
-          this.onStdout?.(stdout)
+          await this.onStdout?.(stdout)
         } else if (stderr !== null) {
-          this.onStderr?.(stderr)
+          await this.onStderr?.(stderr)
         } else if (pty) {
-          this.onPty?.(pty)
+          await this.onPty?.(pty)
         }
       }
     } catch (e) {
-      this.iterationError = handleRpcError(e)
+      this.iterationError = await handleRpcErrorWithHealthCheck(
+        e,
+        this.checkHealth
+      )
+    } finally {
+      this.handleDisconnect()
     }
   }
 }

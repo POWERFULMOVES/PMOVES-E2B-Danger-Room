@@ -1,5 +1,5 @@
 import pytest
-from e2b.exceptions import NotFoundException
+from e2b.exceptions import FileNotFoundException
 from e2b import AsyncSandbox, FileType
 
 
@@ -20,13 +20,14 @@ async def test_get_info_of_file(async_sandbox: AsyncSandbox):
     assert info.owner == "user"
     assert info.group == "user"
     assert info.modified_time is not None
+    assert info.modified_time.tzinfo is not None
 
 
 @pytest.mark.asyncio
 async def test_get_info_of_nonexistent_file(async_sandbox: AsyncSandbox):
     filename = "test_does_not_exist.txt"
 
-    with pytest.raises(NotFoundException):
+    with pytest.raises(FileNotFoundException):
         await async_sandbox.files.get_info(filename)
 
 
@@ -47,13 +48,14 @@ async def test_get_info_of_directory(async_sandbox: AsyncSandbox):
     assert info.owner == "user"
     assert info.group == "user"
     assert info.modified_time is not None
+    assert info.modified_time.tzinfo is not None
 
 
 @pytest.mark.asyncio
 async def test_get_info_of_nonexistent_directory(async_sandbox: AsyncSandbox):
     dirname = "test_does_not_exist_dir"
 
-    with pytest.raises(NotFoundException):
+    with pytest.raises(FileNotFoundException):
         await async_sandbox.files.get_info(dirname)
 
 

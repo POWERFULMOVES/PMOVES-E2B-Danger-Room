@@ -11,35 +11,45 @@ T = TypeVar("T", bound="TemplateRequestResponseV3")
 class TemplateRequestResponseV3:
     """
     Attributes:
-        aliases (list[str]): Aliases of the template
+        template_id (str): Identifier of the template
         build_id (str): Identifier of the last successful build for given template
         public (bool): Whether the template is public or only accessible by the team
-        template_id (str): Identifier of the template
+        names (list[str]): Names of the template
+        tags (list[str]): Tags assigned to the template build
+        aliases (list[str]): Aliases of the template
     """
 
-    aliases: list[str]
+    template_id: str
     build_id: str
     public: bool
-    template_id: str
+    names: list[str]
+    tags: list[str]
+    aliases: list[str]
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        aliases = self.aliases
+        template_id = self.template_id
 
         build_id = self.build_id
 
         public = self.public
 
-        template_id = self.template_id
+        names = self.names
+
+        tags = self.tags
+
+        aliases = self.aliases
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "aliases": aliases,
+                "templateID": template_id,
                 "buildID": build_id,
                 "public": public,
-                "templateID": template_id,
+                "names": names,
+                "tags": tags,
+                "aliases": aliases,
             }
         )
 
@@ -48,19 +58,25 @@ class TemplateRequestResponseV3:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        aliases = cast(list[str], d.pop("aliases"))
+        template_id = d.pop("templateID")
 
         build_id = d.pop("buildID")
 
         public = d.pop("public")
 
-        template_id = d.pop("templateID")
+        names = cast(list[str], d.pop("names"))
+
+        tags = cast(list[str], d.pop("tags"))
+
+        aliases = cast(list[str], d.pop("aliases"))
 
         template_request_response_v3 = cls(
-            aliases=aliases,
+            template_id=template_id,
             build_id=build_id,
             public=public,
-            template_id=template_id,
+            names=names,
+            tags=tags,
+            aliases=aliases,
         )
 
         template_request_response_v3.additional_properties = d

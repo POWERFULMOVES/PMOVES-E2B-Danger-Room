@@ -35,18 +35,12 @@ jobs:
           uppercase: 'true'
           prefix: 'tool_version_'
 
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
+          version: '${{ env.TOOL_VERSION_UV }}'
           python-version: '${{ env.TOOL_VERSION_PYTHON }}'
-
-      - name: Install and configure Poetry
-        uses: snok/install-poetry@v1
-        with:
-          version: '${{ env.TOOL_VERSION_POETRY }}'
-          virtualenvs-create: true
-          virtualenvs-in-project: true
-          installer-parallel: true
+          enable-cache: true
 
       - uses: pnpm/action-setup@v4
         with:
@@ -77,7 +71,29 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Commit new versions
+        # Commit before publishing, because `changeset publish` tags whatever HEAD
+        # it publishes from — tagging afterwards is what left every tag on the
+        # commit before its own version bump (SDK-298). Nothing in the tree
+        # references the artifacts about to be uploaded, so the commit is already
+        # complete. It stays local until something is actually published, so a
+        # publish that uploads nothing leaves the branch untouched and the
+        # changesets intact for a re-run.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # `add -A`, not `commit -a`: `changeset version` writes each package's
+          # CHANGELOG.md as a new file the first time, which `-a` would drop.
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::error::'changeset version' produced no changes, so there is no version bump to publish or tag."
+            exit 1
+          fi
+          git commit -m "[skip ci] Release new versions"
+
       - name: Release new versions
+        id: release
         uses: changesets/action@v1
         with:
           publish: pnpm run publish
@@ -87,45 +103,25 @@ jobs:
           NPM_TOKEN: "" # See https://github.com/changesets/changesets/issues/1152#issuecomment-3190884868
           PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
 
-      - name: Generate SDK reference
-        id: sdk-ref
-        run: pnpm run --recursive generate-ref
-
-      - name: Clone Remote Code Interpreter SDK reference
+      - name: Push new versions
+        # Gate on the tags rather than on whether the publish step succeeded: they
+        # are what has to end up reachable. `changeset publish` tags at HEAD and the
+        # step above pushes them to origin, so if any exist — even from a publish
+        # that then failed partway — the commit they point at has to land, or they
+        # hang off no branch, which is the SDK-298 breakage this change prevents.
+        if: always()
         run: |
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/e2b-dev/code-interpreter
-          cd code-interpreter
-          git sparse-checkout set sdk-reference
-          cp -r sdk-reference/* ../apps/web/src/app/\(docs\)/docs/sdk-reference/
-          cd ..
-          rm -rf code-interpreter
-
-      - name: Clone Remote Desktop SDK reference
-        run: |
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/e2b-dev/desktop
-          cd desktop
-          git sparse-checkout set sdk-reference
-          cp -r sdk-reference/* ../apps/web/src/app/\(docs\)/docs/sdk-reference/
-          cd ..
-          rm -rf desktop
-
-      - name: Show docs file structure
-        run: |
-          if [ -d "./sdk-reference" ]; then
-            tree ./sdk-reference
-          else
-            echo "sdk-reference directory does not exist"
+          if [ -z "$(git tag --points-at HEAD)" ]; then
+            echo "Nothing was published; the version bump stays local and the changesets are intact for a re-dispatch."
+            exit 0
           fi
 
-      - name: Update lock file
-        run: pnpm i --no-link --no-frozen-lockfile
-
-      - name: Commit new versions
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add apps/web/src/app/\(docs\)/docs/sdk-reference 
-          git commit -am "[skip ci] Release new versions" || exit 0
-          git push
+          if ! git push; then
+            # A PR merged mid-release. Merge rather than rebase: the tags already
+            # point at this commit and rewriting it would strand them off the branch.
+            git fetch origin "${GITHUB_REF_NAME}"
+            git merge --no-edit FETCH_HEAD
+            git push
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

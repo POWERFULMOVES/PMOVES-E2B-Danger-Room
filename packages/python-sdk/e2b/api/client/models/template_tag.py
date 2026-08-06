@@ -1,9 +1,11 @@
+import datetime
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
 from uuid import UUID
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
+from dateutil.parser import isoparse
 
 T = TypeVar("T", bound="TemplateTag")
 
@@ -12,25 +14,30 @@ T = TypeVar("T", bound="TemplateTag")
 class TemplateTag:
     """
     Attributes:
+        tag (str): The tag name
         build_id (UUID): Identifier of the build associated with this tag
-        tags (list[str]): Tags of the template
+        created_at (datetime.datetime): Time when the tag was assigned
     """
 
+    tag: str
     build_id: UUID
-    tags: list[str]
+    created_at: datetime.datetime
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        tag = self.tag
+
         build_id = str(self.build_id)
 
-        tags = self.tags
+        created_at = self.created_at.isoformat()
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
+                "tag": tag,
                 "buildID": build_id,
-                "tags": tags,
+                "createdAt": created_at,
             }
         )
 
@@ -39,13 +46,16 @@ class TemplateTag:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        tag = d.pop("tag")
+
         build_id = UUID(d.pop("buildID"))
 
-        tags = cast(list[str], d.pop("tags"))
+        created_at = isoparse(d.pop("createdAt"))
 
         template_tag = cls(
+            tag=tag,
             build_id=build_id,
-            tags=tags,
+            created_at=created_at,
         )
 
         template_tag.additional_properties = d

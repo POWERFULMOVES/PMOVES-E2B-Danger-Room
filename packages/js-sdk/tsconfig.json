@@ -1,23 +1,28 @@
 {
   "compilerOptions": {
     "outDir": "dist",
-    "target": "es6",
+    "target": "es2022",
+    "module": "esnext",
     "lib": [
       "dom",
-      "ESNext"
+      "es2022"
     ],
     "sourceMap": true,
-    "allowJs": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
-    "allowSyntheticDefaultImports": true,
     "strict": true,
     "forceConsistentCasingInFileNames": true,
     "noFallthroughCasesInSwitch": true,
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
     "declaration": true,
+    // TypeScript 7's native tsc does not auto-include node_modules/@types, so
+    // the Node globals the SDK uses (process, Buffer, `node:*` modules) have to
+    // be requested explicitly.
+    "types": [
+      "node"
+    ],
   },
   "include": [
     "src"
@@ -25,6 +30,6 @@
   "exclude": [
     "dist",
     "node_modules",
-    "tsup.config.js"
+    "tsdown.config.ts"
   ]
 }

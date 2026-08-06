@@ -1,8 +1,8 @@
 import asyncio
 import os
-import uuid
-from typing import Callable, Optional
-from uuid import uuid4
+import random
+import string
+from typing import Callable, Dict, Optional
 
 import pytest
 import pytest_asyncio
@@ -11,18 +11,34 @@ from e2b import (
     AsyncCommandHandle,
     AsyncSandbox,
     AsyncTemplate,
+    AsyncVolume,
     CommandExitException,
     CommandHandle,
     LogEntry,
     Sandbox,
     Template,
     TemplateClass,
+    Volume,
 )
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
+def test_api_key() -> str:
+    """Placeholder API key with a valid format for tests that don't hit the API."""
+    return "e2b_" + "0" * 40
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    rep = outcome.get_result()
+    if rep.when == "call":
+        item._test_failed = rep.failed
+
+
+@pytest.fixture()
 def sandbox_test_id():
-    return f"test_{uuid.uuid4()}"
+    return f"test_{_generate_random_string()}"
 
 
 @pytest.fixture()
@@ -31,17 +47,28 @@ def template():
 
 
 @pytest.fixture()
+def httpbin_template():
+    """Template that serves go-httpbin on port 8080 — see `templates/httpbin`.
+
+    Used as a sidecar by tests that need a publicly reachable echo server.
+    """
+    return "httpbin"
+
+
+@pytest.fixture()
 def sandbox_factory(request, template, sandbox_test_id):
     def factory(*, template_name: str = template, **kwargs):
-        kwargs.setdefault("secure", False)
-        kwargs.setdefault("timeout", 5)
-
         metadata = kwargs.setdefault("metadata", dict())
         metadata.setdefault("sandbox_test_id", sandbox_test_id)
 
         sandbox = Sandbox.create(template_name, **kwargs)
 
-        request.addfinalizer(lambda: sandbox.kill())
+        def finalizer():
+            if getattr(request.node, "_test_failed", False):
+                print(f"\n[TEST FAILED] Sandbox ID: {sandbox.sandbox_id}")
+            sandbox.kill()
+
+        request.addfinalizer(finalizer)
 
         return sandbox
 
@@ -53,42 +80,33 @@ def sandbox(sandbox_factory):
     return sandbox_factory()
 
 
-# override the event loop so it never closes
-# this helps us with the global-scoped async http transport
-@pytest.fixture(scope="session")
-def event_loop():
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+@pytest_asyncio.fixture
+async def async_sandbox_factory(request, template, sandbox_test_id):
+    sandboxes: list = []
 
-
-@pytest.fixture
-def async_sandbox_factory(request, template, sandbox_test_id, event_loop):
     async def factory(*, template_name: str = template, **kwargs):
-        kwargs.setdefault("timeout", 5)
-
         metadata = kwargs.setdefault("metadata", dict())
         metadata.setdefault("sandbox_test_id", sandbox_test_id)
 
         sandbox = await AsyncSandbox.create(template_name, **kwargs)
-
-        def kill():
-            async def _kill():
-                await sandbox.kill()
-
-            event_loop.run_until_complete(_kill())
-
-        request.addfinalizer(kill)
-
+        sandboxes.append(sandbox)
         return sandbox
 
-    return factory
+    yield factory
+
+    if getattr(request.node, "_test_failed", False):
+        for sandbox in sandboxes:
+            print(f"\n[TEST FAILED] Sandbox ID: {sandbox.sandbox_id}")
+
+    results = await asyncio.gather(
+        *(sandbox.kill() for sandbox in sandboxes), return_exceptions=True
+    )
+    for sandbox, result in zip(sandboxes, results):
+        if isinstance(result, BaseException):
+            print(f"\n[TEARDOWN FAILED] Sandbox ID: {sandbox.sandbox_id}: {result!r}")
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def async_sandbox(async_sandbox_factory):
     return await async_sandbox_factory()
 
@@ -97,18 +115,42 @@ async def async_sandbox(async_sandbox_factory):
 def build():
     def _build(
         template: TemplateClass,
-        alias: Optional[str] = None,
+        name: Optional[str] = None,
         skip_cache: bool = False,
         on_build_logs: Optional[Callable[[LogEntry], None]] = None,
     ):
-        return Template.build(
-            template,
-            alias=alias or f"e2b-test-{uuid4()}",
-            cpu_count=1,
-            memory_mb=1024,
-            skip_cache=skip_cache,
-            on_build_logs=on_build_logs,
-        )
+        build_name = name or f"e2b-test-{_generate_random_string()}"
+        build_info: Dict[str, Optional[str]] = {"template_id": None, "build_id": None}
+
+        def capture_logs(log: LogEntry):
+            import re
+
+            if "Template created with ID:" in log.message:
+                match = re.search(
+                    r"Template created with ID: ([^,]+), Build ID: (.+)", log.message
+                )
+                if match:
+                    build_info["template_id"] = match.group(1)
+                    build_info["build_id"] = match.group(2)
+            if on_build_logs:
+                on_build_logs(log)
+
+        try:
+            return Template.build(
+                template,
+                build_name,
+                cpu_count=1,
+                memory_mb=1024,
+                skip_cache=skip_cache,
+                on_build_logs=capture_logs,
+            )
+        except Exception as e:
+            print(
+                f"\n[BUILD FAILED] name={build_name}, "
+                f"template_id={build_info['template_id']}, "
+                f"build_id={build_info['build_id']}, error={e}"
+            )
+            raise
 
     return _build
 
@@ -117,18 +159,42 @@ def build():
 def async_build():
     async def _async_build(
         template: TemplateClass,
-        alias: Optional[str] = None,
+        name: Optional[str] = None,
         skip_cache: bool = False,
         on_build_logs: Optional[Callable[[LogEntry], None]] = None,
     ):
-        return await AsyncTemplate.build(
-            template,
-            alias=alias or f"e2b-test-{uuid4()}",
-            cpu_count=1,
-            memory_mb=1024,
-            skip_cache=skip_cache,
-            on_build_logs=on_build_logs,
-        )
+        build_name = name or f"e2b-test-{_generate_random_string()}"
+        build_info: Dict[str, Optional[str]] = {"template_id": None, "build_id": None}
+
+        def capture_logs(log: LogEntry):
+            import re
+
+            if "Template created with ID:" in log.message:
+                match = re.search(
+                    r"Template created with ID: ([^,]+), Build ID: (.+)", log.message
+                )
+                if match:
+                    build_info["template_id"] = match.group(1)
+                    build_info["build_id"] = match.group(2)
+            if on_build_logs:
+                on_build_logs(log)
+
+        try:
+            return await AsyncTemplate.build(
+                template,
+                build_name,
+                cpu_count=1,
+                memory_mb=1024,
+                skip_cache=skip_cache,
+                on_build_logs=capture_logs,
+            )
+        except Exception as e:
+            print(
+                f"\n[BUILD FAILED] name={build_name}, "
+                f"template_id={build_info['template_id']}, "
+                f"build_id={build_info['build_id']}, error={e}"
+            )
+            raise
 
     return _async_build
 
@@ -180,3 +246,44 @@ class Helpers:
 @pytest.fixture
 def helpers():
     return Helpers
+
+
+def _generate_random_string(length: int = 8) -> str:
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+
+def _skip_unless_volume_tests_enabled():
+    if os.getenv("ENABLE_VOLUME_TESTS") is None:
+        pytest.skip("skipped because ENABLE_VOLUME_TESTS is not set")
+
+
+@pytest.fixture
+def volume(request):
+    _skip_unless_volume_tests_enabled()
+    vol = Volume.create(f"test-vol-{_generate_random_string()}")
+
+    def finalizer():
+        if getattr(request.node, "_test_failed", False):
+            print(f"\n[TEST FAILED] Volume ID: {vol.volume_id}")
+        try:
+            Volume.destroy(vol.volume_id)
+        except Exception:
+            pass
+
+    request.addfinalizer(finalizer)
+    return vol
+
+
+@pytest_asyncio.fixture
+async def async_volume(request):
+    _skip_unless_volume_tests_enabled()
+    vol = await AsyncVolume.create(f"test-vol-{_generate_random_string()}")
+    try:
+        yield vol
+    finally:
+        if getattr(request.node, "_test_failed", False):
+            print(f"\n[TEST FAILED] Volume ID: {vol.volume_id}")
+        try:
+            await AsyncVolume.destroy(vol.volume_id)
+        except Exception:
+            pass

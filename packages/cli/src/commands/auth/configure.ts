@@ -1,16 +1,15 @@
 import * as commander from 'commander'
-import * as fs from 'fs'
 import * as chalk from 'chalk'
 import * as e2b from 'e2b'
-import * as path from 'path'
 
-import { USER_CONFIG_PATH } from 'src/user'
 import {
-  client,
-  connectionConfig,
-  ensureAccessToken,
-  ensureUserConfig,
-} from 'src/api'
+  USER_CONFIG_PATH,
+  getConfigRefreshTimestamp,
+  getUserConfig,
+  writeUserConfig,
+} from 'src/user'
+import { ensureUserConfig, Teams } from 'src/api'
+import { ensureValidAccessToken } from 'src/utils/token-refresh'
 import { asBold, asFormattedTeam } from '../../utils/format'
 import { handleE2BRequestError } from '../../utils/errors'
 
@@ -21,39 +20,51 @@ export const configureCommand = new commander.Command('configure')
 
     console.log('Configuring user...\n')
 
-    if (!fs.existsSync(USER_CONFIG_PATH)) {
+    // A file that exists but fails validation counts as signed out too —
+    // getUserConfig returns null for it (and prints the deprecation message).
+    if (!getUserConfig()) {
       console.log('No user config found, run `e2b auth login` to log in first.')
       return
     }
 
+    // ensureValidAccessToken may refresh tokens and write them to disk.
+    // Re-read the config afterwards so we persist the refreshed tokens
+    // instead of overwriting them with stale in-memory copies.
+    const accessToken = await ensureValidAccessToken()
     const userConfig = ensureUserConfig()
-    ensureAccessToken()
-    const signal = connectionConfig.getSignal()
 
-    const res = await client.api.GET('/teams', { signal })
+    const config = new e2b.ConnectionConfig({
+      apiHeaders: { Authorization: `Bearer ${accessToken}` },
+    })
+    const authClient = new e2b.ApiClient(config, { requireApiKey: false })
 
-    handleE2BRequestError(res, 'Error getting teams')
+    const res = await authClient.api.GET('/teams', {
+      signal: config.getSignal(),
+    })
+
+    handleE2BRequestError(res, 'Error getting projects')
+    const teams = res.data as Teams
 
     const team = (
       await inquirer.default.prompt([
         {
-          name: 'team',
-          message: chalk.default.underline('Select team'),
+          name: 'project',
+          message: chalk.default.underline('Select project'),
           type: 'list',
           pageSize: 50,
-          choices: res.data.map((team: e2b.components['schemas']['Team']) => ({
-            name: asFormattedTeam(team, userConfig.teamId),
+          choices: teams.map((team) => ({
+            name: asFormattedTeam(team, userConfig.projectId),
             value: team,
           })),
         },
       ])
-    )['team']
+    )['project']
 
-    userConfig.teamName = team.name
-    userConfig.teamId = team.teamID
-    userConfig.teamApiKey = team.apiKey
-    fs.mkdirSync(path.dirname(USER_CONFIG_PATH), { recursive: true })
-    fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2))
+    userConfig.projectName = team.name
+    userConfig.projectId = team.teamID
+    userConfig.projectApiKey = team.apiKey
+    userConfig.last_refresh = getConfigRefreshTimestamp()
+    writeUserConfig(USER_CONFIG_PATH, userConfig)
 
-    console.log(`Team ${asBold(team.name)} (${team.teamID}) selected.\n`)
+    console.log(`Project ${asBold(team.name)} (${team.teamID}) selected.\n`)
   })

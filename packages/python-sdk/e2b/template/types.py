@@ -1,9 +1,93 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import List, Literal, Optional, TypedDict, Union
 
 from typing_extensions import NotRequired
+
+from e2b.template.logger import LogEntry
+
+
+class TemplateBuildStatus(str, Enum):
+    """
+    Status of a template build.
+    """
+
+    BUILDING = "building"
+    WAITING = "waiting"
+    READY = "ready"
+    ERROR = "error"
+
+
+@dataclass
+class BuildStatusReason:
+    """
+    Reason for the current build status (typically for errors).
+    """
+
+    message: str
+    """Message with the status reason."""
+
+    step: Optional[str] = None
+    """Step that failed."""
+
+    log_entries: List[LogEntry] = field(default_factory=list)
+    """Log entries related to the status reason."""
+
+
+@dataclass
+class TemplateBuildStatusResponse:
+    """
+    Response from getting build status.
+    """
+
+    build_id: str
+    """Build identifier."""
+
+    template_id: str
+    """Template identifier."""
+
+    status: TemplateBuildStatus
+    """Current status of the build."""
+
+    log_entries: List[LogEntry]
+    """Build log entries."""
+
+    logs: List[str]
+    """Build logs (raw strings). Deprecated: use log_entries instead."""
+
+    reason: Optional[BuildStatusReason] = None
+    """Reason for the current status (typically for errors)."""
+
+
+@dataclass
+class TemplateTagInfo:
+    """
+    Information about assigned template tags.
+    """
+
+    build_id: str
+    """Build identifier associated with this tag."""
+
+    tags: List[str]
+    """Assigned tags of the template."""
+
+
+@dataclass
+class TemplateTag:
+    """
+    Detailed information about a single template tag.
+    """
+
+    tag: str
+    """Name of the tag."""
+
+    build_id: str
+    """Build identifier associated with this tag."""
+
+    created_at: datetime
+    """When this tag was assigned."""
 
 
 class InstructionType(str, Enum):
@@ -29,6 +113,7 @@ class CopyItem(TypedDict):
     user: NotRequired[Optional[str]]
     mode: NotRequired[Optional[int]]
     resolveSymlinks: NotRequired[Optional[bool]]
+    gzip: NotRequired[Optional[bool]]
 
 
 class Instruction(TypedDict):
@@ -42,6 +127,7 @@ class Instruction(TypedDict):
     forceUpload: NotRequired[Optional[Literal[True]]]
     filesHash: NotRequired[Optional[str]]
     resolveSymlinks: NotRequired[Optional[bool]]
+    gzip: NotRequired[Optional[bool]]
 
 
 class GenericDockerRegistry(TypedDict):
@@ -100,6 +186,9 @@ class BuildInfo:
     Information about a built template.
     """
 
-    alias: str
     template_id: str
     build_id: str
+    name: str
+    # Deprecated: use name instead
+    alias: str
+    tags: List[str] = field(default_factory=list)

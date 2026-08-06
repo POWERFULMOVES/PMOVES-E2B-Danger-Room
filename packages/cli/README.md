@@ -1,5 +1,9 @@
 <p align="center">
-  <img width="100" src="https://raw.githubusercontent.com/e2b-dev/E2B/refs/heads/main/readme-assets/logo-circle.png" alt="e2b logo">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/e2b-dev/E2B/refs/heads/main/readme-assets/logo-white.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/e2b-dev/E2B/refs/heads/main/readme-assets/logo-black.png">
+    <img alt="E2B Logo" src="https://raw.githubusercontent.com/e2b-dev/E2B/refs/heads/main/readme-assets/logo-black.png" width="200">
+  </picture>
 </p>
 
 # E2B CLI
@@ -27,13 +31,10 @@ e2b auth login
 ```
 
 > [!NOTE]
-> To authenticate without the ability to open the browser, provide
-> `E2B_ACCESS_TOKEN` as an environment variable. You can find your token
-> in Account Settings under the Team selector at [e2b.dev/dashboard](https://e2b.dev/dashboard). Then use the CLI like this:
-> `E2B_ACCESS_TOKEN=sk_e2b_... e2b template build`.
-
-> [!IMPORTANT]  
-> Note the distinction between `E2B_ACCESS_TOKEN` and `E2B_API_KEY`.
+> To authenticate without the ability to open the browser (e.g. in CI/CD),
+> provide `E2B_API_KEY` as an environment variable. You can find your API key
+> in the [API Keys](https://e2b.dev/dashboard?tab=keys) tab in the E2B dashboard.
+> Then use the CLI like this: `E2B_API_KEY=e2b_... e2b template create`.
 
 ### 3. Check out docs
 

@@ -1,11 +1,13 @@
+import logging
 import os
 
-from typing import Optional, Dict, TypedDict
+from typing import cast, Optional, Dict, TypedDict
 
 from httpx._types import ProxyTypes
 from typing_extensions import Unpack
 
 from e2b.api.metadata import package_version
+from e2b.sandbox_domains import is_supported_sandbox_domain
 
 REQUEST_TIMEOUT: float = 60.0  # 60 seconds
 
@@ -24,10 +26,19 @@ class ApiParams(TypedDict, total=False):
     """Timeout for the request in **seconds**, defaults to 60 seconds."""
 
     headers: Optional[Dict[str, str]]
-    """Additional headers to send with the request."""
+    """Additional headers to send with the request. Deprecated, use api_headers instead."""
+
+    api_headers: Optional[Dict[str, str]]
+    """Additional headers to send with E2B API requests."""
 
     api_key: Optional[str]
     """E2B API Key to use for authentication, defaults to `E2B_API_KEY` environment variable."""
+
+    validate_api_key: Optional[bool]
+    """Whether to validate the format of the E2B API key on the client side.
+    Disable this when your deployment issues API keys that don't match the
+    default `e2b_` format. Defaults to `E2B_VALIDATE_API_KEY` environment
+    variable or `True`."""
 
     domain: Optional[str]
     """E2B domain to use for authentication, defaults to `E2B_DOMAIN` environment variable."""
@@ -45,12 +56,42 @@ class ApiParams(TypedDict, total=False):
     """URL to connect to sandbox, defaults to `E2B_SANDBOX_URL` environment variable."""
 
 
+class ApiParamsWithLogger(ApiParams, total=False):
+    """:class:`ApiParams` plus the construction-time ``logger``.
+
+    Internal type returned by :meth:`ConnectionConfig.get_api_params` so that the
+    logger a sandbox was created/connected with keeps propagating to the
+    throwaway ``ConnectionConfig`` that instance control-plane methods rebuild.
+    Unlike :class:`ApiParams`, ``logger`` is not a public per-request option.
+    """
+
+    logger: Optional[logging.Logger]
+
+
 class ConnectionConfig:
     """
     Configuration for the connection to the API.
     """
 
     envd_port = 49983
+
+    _integration: Optional[str] = None
+
+    @classmethod
+    def set_integration(cls, integration: Optional[str]) -> None:
+        """
+        Identify traffic from an integration wrapping the E2B SDK by appending
+        ``integration`` (e.g. ``"e2b-code-interpreter/0.1.0"``) to the
+        ``User-Agent`` header of every request.
+
+        Call once at startup, before any ``ConnectionConfig`` is constructed —
+        configs read the value at construction time. Pass ``None`` to clear.
+
+        Internal use only — not part of the public, stable API.
+
+        :meta private:
+        """
+        ConnectionConfig._integration = integration
 
     @staticmethod
     def _domain():
@@ -65,6 +106,10 @@ class ConnectionConfig:
         return os.getenv("E2B_API_KEY")
 
     @staticmethod
+    def _validate_api_key():
+        return os.getenv("E2B_VALIDATE_API_KEY", "true").lower() != "false"
+
+    @staticmethod
     def _api_url():
         return os.getenv("E2B_API_URL")
 
@@ -76,25 +121,68 @@ class ConnectionConfig:
     def _access_token():
         return os.getenv("E2B_ACCESS_TOKEN")
 
+    @staticmethod
+    def _build_user_agent() -> str:
+        user_agent_parts = [f"e2b-python-sdk/{package_version}"]
+
+        if ConnectionConfig._integration:
+            user_agent_parts.append(ConnectionConfig._integration)
+
+        return " ".join(user_agent_parts)
+
+    def _apply_user_agent(
+        self,
+        headers: Dict[str, str],
+        user_agent_override: Optional[str],
+    ) -> bool:
+        """
+        Set the ``User-Agent`` on ``headers``: an explicitly provided value
+        always wins; otherwise the SDK-built one, tagged with the current
+        integration.
+
+        Returns whether the SDK-built value was applied, so callers can keep
+        it in sync with the current integration on later rebuilds.
+        """
+        if user_agent_override is not None:
+            headers["User-Agent"] = user_agent_override
+            return False
+
+        headers["User-Agent"] = self._build_user_agent()
+        return True
+
     def __init__(
         self,
         domain: Optional[str] = None,
         debug: Optional[bool] = None,
         api_key: Optional[str] = None,
+        validate_api_key: Optional[bool] = None,
         api_url: Optional[str] = None,
         sandbox_url: Optional[str] = None,
         access_token: Optional[str] = None,
         request_timeout: Optional[float] = None,
         headers: Optional[Dict[str, str]] = None,
+        api_headers: Optional[Dict[str, str]] = None,
         extra_sandbox_headers: Optional[Dict[str, str]] = None,
         proxy: Optional[ProxyTypes] = None,
+        logger: Optional[logging.Logger] = None,
     ):
+        self.logger = logger
         self.domain = domain or ConnectionConfig._domain()
-        self.debug = debug or ConnectionConfig._debug()
+        self.debug = debug if debug is not None else ConnectionConfig._debug()
         self.api_key = api_key or ConnectionConfig._api_key()
+        self.validate_api_key = (
+            validate_api_key
+            if validate_api_key is not None
+            else ConnectionConfig._validate_api_key()
+        )
+        # Deprecated: pass the token through `api_headers` instead, e.g.
+        # api_headers={"Authorization": f"Bearer {token}"}.
         self.access_token = access_token or ConnectionConfig._access_token()
-        self.headers = headers or {}
-        self.headers["User-Agent"] = f"e2b-python-sdk/{package_version}"
+        self.headers = {**(headers or {}), **(api_headers or {})}
+        self._user_agent_is_sdk_built = self._apply_user_agent(
+            self.headers,
+            self.headers.get("User-Agent"),
+        )
         self.__extra_sandbox_headers = extra_sandbox_headers or {}
 
         self.proxy = proxy
@@ -104,20 +192,15 @@ class ConnectionConfig:
             request_timeout,
         )
 
-        if request_timeout == 0:
-            self.request_timeout = None
-        elif request_timeout is not None:
-            self.request_timeout = request_timeout
-        else:
-            self.request_timeout = REQUEST_TIMEOUT
-
         self.api_url = (
             api_url
             or ConnectionConfig._api_url()
             or ("http://localhost:3000" if self.debug else f"https://api.{self.domain}")
         )
 
-        self._sandbox_url = sandbox_url or ConnectionConfig._sandbox_url()
+        self._sandbox_url: Optional[str] = (
+            sandbox_url or ConnectionConfig._sandbox_url()
+        )
 
     @staticmethod
     def _get_request_timeout(
@@ -136,9 +219,25 @@ class ConnectionConfig:
 
     def get_sandbox_url(self, sandbox_id: str, sandbox_domain: str) -> str:
         if self._sandbox_url:
-            return self._sandbox_url
+            return self._sandbox_url  # type: ignore[return-value]
 
-        return f"{'http' if self.debug else 'https'}://{self.get_host(sandbox_id, sandbox_domain, self.envd_port)}"
+        if self.debug:
+            return f"http://{self.get_host(sandbox_id, sandbox_domain, self.envd_port)}"
+
+        sandbox_domain = sandbox_domain or self.domain
+        if is_supported_sandbox_domain(sandbox_domain):
+            return f"https://sandbox.{sandbox_domain}"
+
+        return f"https://{self.get_host(sandbox_id, sandbox_domain, self.envd_port)}"
+
+    def get_sandbox_direct_url(self, sandbox_id: str, sandbox_domain: str) -> str:
+        if self._sandbox_url:
+            return self._sandbox_url  # type: ignore[return-value]
+
+        if self.debug:
+            return f"http://{self.get_host(sandbox_id, sandbox_domain, self.envd_port)}"
+
+        return f"https://{self.get_host(sandbox_id, sandbox_domain, self.envd_port)}"
 
     def get_host(self, sandbox_id: str, sandbox_domain: str, port: int) -> str:
         """
@@ -172,26 +271,54 @@ class ConnectionConfig:
         :return: Dictionary of parameters for the API call
         """
         headers = opts.get("headers")
+        api_headers = opts.get("api_headers")
         request_timeout = opts.get("request_timeout")
         api_key = opts.get("api_key")
+        validate_api_key = opts.get("validate_api_key")
         api_url = opts.get("api_url")
         domain = opts.get("domain")
         debug = opts.get("debug")
         proxy = opts.get("proxy")
+        sandbox_url = opts.get("sandbox_url")
 
         req_headers = self.headers.copy()
         if headers is not None:
             req_headers.update(headers)
+        if api_headers is not None:
+            req_headers.update(api_headers)
+        if self._user_agent_is_sdk_built:
+            # Same precedence as the merge above: api_headers wins over headers.
+            per_call_user_agent = {**(headers or {}), **(api_headers or {})}.get(
+                "User-Agent"
+            )
+            self._apply_user_agent(req_headers, per_call_user_agent)
 
+        # `logger` is a construction-time option rather than a per-request
+        # ApiParams field, but it must propagate to the throwaway
+        # ConnectionConfig that instance control-plane methods (kill, pause,
+        # set_timeout, get_info, connect, ...) rebuild from these params, so
+        # those requests keep logging with the logger the sandbox was created
+        # or connected with.
         return dict(
-            ApiParams(
+            ApiParamsWithLogger(
                 api_key=api_key if api_key is not None else self.api_key,
+                validate_api_key=(
+                    validate_api_key
+                    if validate_api_key is not None
+                    else self.validate_api_key
+                ),
                 api_url=api_url if api_url is not None else self.api_url,
                 domain=domain if domain is not None else self.domain,
                 debug=debug if debug is not None else self.debug,
                 request_timeout=self.get_request_timeout(request_timeout),
                 headers=req_headers,
                 proxy=proxy if proxy is not None else self.proxy,
+                sandbox_url=(
+                    sandbox_url
+                    if sandbox_url is not None
+                    else cast(Optional[str], self._sandbox_url)
+                ),
+                logger=self.logger,
             )
         )
 
@@ -201,7 +328,7 @@ class ConnectionConfig:
         We need this separate as we use the same header for E2B access token to API and envd access token to sandbox.
         """
         return {
-            **self.headers,
+            "User-Agent": self.headers["User-Agent"],
             **self.__extra_sandbox_headers,
         }
 

@@ -1,6 +1,71 @@
 import pytest
 
-from e2b import NotFoundException, FilesystemEventType, Sandbox, SandboxException
+from e2b import (
+    FileNotFoundException,
+    FileType,
+    FilesystemEventType,
+    Sandbox,
+    SandboxException,
+)
+
+
+def test_watch_directory_changes_with_entry_info(sandbox: Sandbox):
+    dirname = "test_watch_dir_entry"
+    filename = "test_watch.txt"
+    content = "This file will be watched."
+    new_content = "This file has been modified."
+
+    sandbox.files.make_dir(dirname)
+    sandbox.files.write(f"{dirname}/{filename}", content)
+
+    handle = sandbox.files.watch_dir(dirname, include_entry=True)
+    sandbox.files.write(f"{dirname}/{filename}", new_content)
+
+    events = handle.get_new_events()
+    write_event = None
+    for event in events:
+        if event.type == FilesystemEventType.WRITE and event.name == filename:
+            write_event = event
+            break
+
+    assert write_event is not None, (
+        f"Expected WRITE event for {filename}, but got events: {events}"
+    )
+    # The entry is populated best-effort for events where the path still exists.
+    assert write_event.entry is not None
+    assert write_event.entry.name == filename
+    assert write_event.entry.path == f"/home/user/{dirname}/{filename}"
+    assert write_event.entry.type == FileType.FILE
+
+    handle.stop()
+
+
+def test_watch_directory_changes_with_network_mounts_allowed(sandbox: Sandbox):
+    dirname = "test_watch_dir_network_mounts"
+    filename = "test_watch.txt"
+    content = "This file will be watched."
+    new_content = "This file has been modified."
+
+    sandbox.files.make_dir(dirname)
+    sandbox.files.write(f"{dirname}/{filename}", content)
+
+    # The flag only lifts the network-mount restriction — watching a regular
+    # directory must work the same with it enabled.
+    handle = sandbox.files.watch_dir(dirname, allow_network_mounts=True)
+    sandbox.files.write(f"{dirname}/{filename}", new_content)
+
+    events = handle.get_new_events()
+    write_event = None
+    for event in events:
+        if event.type == FilesystemEventType.WRITE and event.name == filename:
+            write_event = event
+            break
+
+    assert write_event is not None, (
+        f"Expected WRITE event for {filename}, but got events: {events}"
+    )
+
+    handle.stop()
 
 
 def test_watch_directory_changes(sandbox: Sandbox):
@@ -108,7 +173,7 @@ def test_watch_recursive_directory_after_nested_folder_addition(sandbox: Sandbox
 def test_watch_non_existing_directory(sandbox: Sandbox):
     dirname = "non_existing_watch_dir"
 
-    with pytest.raises(NotFoundException):
+    with pytest.raises(FileNotFoundException):
         sandbox.files.watch_dir(dirname)
 
 

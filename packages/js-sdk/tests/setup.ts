@@ -1,5 +1,4 @@
-import { randomUUID } from 'node:crypto'
-import { test as base } from 'vitest'
+import { test as base, onTestFailed } from 'vitest'
 import {
   BuildInfo,
   LogEntry,
@@ -7,6 +6,7 @@ import {
   SandboxOpts,
   Template,
   TemplateClass,
+  Volume,
 } from '../src'
 import { template } from './template'
 
@@ -17,26 +17,54 @@ interface SandboxFixture {
   sandboxOpts: Partial<SandboxOpts>
 }
 
+interface VolumeFixture {
+  volume: Volume
+}
+
 interface BuildTemplateFixture {
   buildTemplate: (
     template: TemplateClass,
-    options?: { alias?: string; skipCache?: boolean },
+    options?: { name?: string; skipCache?: boolean },
     onBuildLogs?: (logEntry: LogEntry) => void
   ) => Promise<BuildInfo>
 }
 
-function buildTemplate(
+async function buildTemplate(
   template: TemplateClass,
-  options?: { alias?: string; skipCache?: boolean },
+  options?: { name?: string; skipCache?: boolean },
   onBuildLogs?: (logEntry: LogEntry) => void
-) {
-  return Template.build(template, {
-    alias: options?.alias || `e2b-test-${randomUUID()}`,
-    cpuCount: 1,
-    memoryMB: 1024,
-    skipCache: options?.skipCache,
-    onBuildLogs: onBuildLogs,
-  })
+): Promise<BuildInfo> {
+  const buildName = options?.name || `e2b-test-${generateRandomString()}`
+  const buildInfo: { templateId?: string; buildId?: string } = {}
+
+  const captureLogs = (log: LogEntry) => {
+    if (log.message.includes('Template created with ID:')) {
+      const match = log.message.match(
+        /Template created with ID: ([^,]+), Build ID: (.+)/
+      )
+      if (match) {
+        buildInfo.templateId = match[1]
+        buildInfo.buildId = match[2]
+      }
+    }
+    onBuildLogs?.(log)
+  }
+
+  try {
+    return await Template.build(template, buildName, {
+      cpuCount: 1,
+      memoryMB: 1024,
+      skipCache: options?.skipCache,
+      onBuildLogs: captureLogs,
+    })
+  } catch (e) {
+    console.error(
+      `\n[BUILD FAILED] name=${buildName}, ` +
+        `template_id=${buildInfo.templateId}, ` +
+        `build_id=${buildInfo.buildId}, error=${e}`
+    )
+    throw e
+  }
 }
 
 export const sandboxTest = base.extend<SandboxFixture>({
@@ -55,6 +83,9 @@ export const sandboxTest = base.extend<SandboxFixture>({
       const sandbox = await Sandbox.create(template, {
         metadata: { sandboxTestId },
         ...sandboxOpts,
+      })
+      onTestFailed(() => {
+        console.error(`\n[TEST FAILED] Sandbox ID: ${sandbox.sandboxId}`)
       })
       try {
         await use(sandbox)
@@ -84,8 +115,34 @@ export const buildTemplateTest = base.extend<BuildTemplateFixture>({
   ],
 })
 
+export const volumeTest = base
+  .extend<VolumeFixture>({
+    volume: [
+      // eslint-disable-next-line no-empty-pattern
+      async ({}, use) => {
+        const volume = await Volume.create(`test-vol-${generateRandomString()}`)
+        onTestFailed(() => {
+          console.error(`\n[TEST FAILED] Volume ID: ${volume.volumeId}`)
+        })
+        try {
+          await use(volume)
+        } finally {
+          try {
+            await Volume.destroy(volume.volumeId)
+          } catch {
+            // Ignore cleanup errors
+          }
+        }
+      },
+      { auto: false },
+    ],
+  })
+  .skipIf(process.env.ENABLE_VOLUME_TESTS === undefined)
+
 export const isDebug = process.env.E2B_DEBUG !== undefined
-export const isIntegrationTest = process.env.E2B_INTEGRATION_TEST !== undefined
+
+/** Placeholder API key with a valid format for tests that don't hit the API. */
+export const TEST_API_KEY = `e2b_${'0'.repeat(40)}`
 
 function generateRandomString(length: number = 8): string {
   return Math.random()
@@ -95,6 +152,15 @@ function generateRandomString(length: number = 8): string {
 
 export async function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Returns the API URL for the given path, using E2B_DOMAIN env var.
+ * Supports msw path parameters like :templateID
+ */
+export function apiUrl(path: string): string {
+  const domain = process.env.E2B_DOMAIN || 'e2b.app'
+  return `https://api.${domain}${path}`
 }
 
 export { template }

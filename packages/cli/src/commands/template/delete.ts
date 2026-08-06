@@ -13,7 +13,9 @@ import {
   configOption,
   pathOption,
   selectMultipleOption,
-  teamOption,
+  deprecatedTeamOption,
+  projectIdFromOptions,
+  projectOption,
 } from 'src/options'
 import {
   E2BConfig,
@@ -26,9 +28,8 @@ import { getRoot } from 'src/utils/filesystem'
 import { listSandboxTemplates } from './list'
 import { getPromptTemplates } from 'src/utils/templatePrompt'
 import { confirm } from 'src/utils/confirm'
-import { client } from 'src/api'
+import { client, resolveProjectId } from 'src/api'
 import { handleE2BRequestError } from '../../utils/errors'
-import { getUserConfig } from 'src/user'
 
 async function deleteTemplate(templateID: string) {
   const res = await client.api.DELETE('/templates/{templateID}', {
@@ -56,7 +57,8 @@ export const deleteCommand = new commander.Command('delete')
   .addOption(pathOption)
   .addOption(configOption)
   .addOption(selectMultipleOption)
-  .addOption(teamOption)
+  .addOption(projectOption)
+  .addOption(deprecatedTeamOption)
   .alias('dl')
   .option('-y, --yes', 'skip manual delete confirmation')
   .action(
@@ -67,11 +69,12 @@ export const deleteCommand = new commander.Command('delete')
         config?: string
         yes?: boolean
         select?: boolean
+        project?: string
         team?: string
       }
     ) => {
       try {
-        let teamId = opts.team
+        let projectId = projectIdFromOptions(opts)
 
         const root = getRoot(opts.path)
 
@@ -84,13 +87,10 @@ export const deleteCommand = new commander.Command('delete')
             template_id: template,
           })
         } else if (opts.select) {
-          const userConfig = getUserConfig()
-          if (userConfig) {
-            teamId = teamId || userConfig.teamId
-          }
+          projectId = resolveProjectId(projectId)
 
           const allTemplates = await listSandboxTemplates({
-            teamID: teamId,
+            projectId,
           })
 
           const selectedTemplates = await getPromptTemplates(

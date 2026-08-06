@@ -9,12 +9,12 @@ import { UserConfig } from '../user'
 export const primaryColor = '#FFB766'
 
 export function asFormattedConfig(config: UserConfig) {
-  const email = asBold(config.email)
-  const team = config.teamName
-    ? asBold(config.teamName)
-    : asRed('Log out and log in to get team name')
-  const teamId = asBold(config.teamId)
-  return `You are logged in as ${email},\nSelected team: ${team} (${teamId})`
+  const email = asBold(config.identity.email)
+  const project = config.projectName
+    ? asBold(config.projectName)
+    : asRed('Log out and log in to get project name')
+  const projectId = asBold(config.projectId)
+  return `You are logged in as ${email},\nSelected project: ${project} (${projectId})`
 }
 
 export function asFormattedTeam(
@@ -24,7 +24,7 @@ export function asFormattedTeam(
   const name = asBold(team.name)
   const id = asBold(team.teamID)
   const isSelected =
-    team.teamID == selected ? asPrimary(' (currently selected team)') : ''
+    team.teamID == selected ? asPrimary(' (currently selected project)') : ''
   return `${name} (${id})${isSelected}`
 }
 
@@ -72,10 +72,6 @@ export function asTimestamp(content: string) {
   return chalk.default.blue(content)
 }
 
-export function asSandboxTemplate(pathInTemplate?: string) {
-  return chalk.default.green(pathInTemplate)
-}
-
 export function asLocal(pathInLocal?: string) {
   return chalk.default.blue(pathInLocal)
 }
@@ -87,10 +83,6 @@ export function asLocalRelative(absolutePathInLocal?: string) {
 
 export function asBuildLogs(content: string) {
   return chalk.default.blueBright(content)
-}
-
-export function asHeadline(content: string) {
-  return chalk.default.underline(asPrimary(asBold(content)))
 }
 
 export function withUnderline(content: string) {

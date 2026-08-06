@@ -6,6 +6,7 @@ from packaging.version import Version
 from e2b.connection_config import ConnectionConfig, default_username
 from e2b.envd.api import ENVD_API_FILES_ROUTE
 from e2b.envd.versions import ENVD_DEFAULT_USER
+from e2b.exceptions import InvalidArgumentException
 from e2b.sandbox.signature import get_signature
 
 
@@ -14,7 +15,6 @@ class SandboxOpts(TypedDict):
     sandbox_domain: Optional[str]
     envd_version: Version
     envd_access_token: Optional[str]
-    sandbox_url: Optional[str]
     traffic_access_token: Optional[str]
     connection_config: ConnectionConfig
 
@@ -45,6 +45,9 @@ class SandboxBase:
         self.__envd_api_url = self.connection_config.get_sandbox_url(
             self.sandbox_id, self.sandbox_domain
         )
+        self.__envd_direct_url = self.connection_config.get_sandbox_direct_url(
+            self.sandbox_id, self.sandbox_domain
+        )
         self.__mcp_token: Optional[str] = None
 
     @property
@@ -73,12 +76,16 @@ class SandboxBase:
         return self.__traffic_access_token
 
     @property
-    def sandbox_domain(self) -> Optional[str]:
+    def sandbox_domain(self) -> str:
         return self.__sandbox_domain
 
     @property
     def envd_api_url(self) -> str:
         return self.__envd_api_url
+
+    @property
+    def envd_direct_url(self) -> str:
+        return self.__envd_direct_url
 
     @property
     def sandbox_id(self) -> str:
@@ -94,7 +101,7 @@ class SandboxBase:
         signature: Optional[str] = None,
         signature_expiration: Optional[int] = None,
     ) -> str:
-        url = urllib.parse.urljoin(self.envd_api_url, ENVD_API_FILES_ROUTE)
+        url = urllib.parse.urljoin(self.envd_direct_url, ENVD_API_FILES_ROUTE)
         query = {"path": path} if path else {}
 
         if user:
@@ -132,11 +139,16 @@ class SandboxBase:
         :return: URL for downloading file
         """
 
+        use_signature = self._envd_access_token is not None
+        if not use_signature and use_signature_expiration is not None:
+            raise InvalidArgumentException(
+                "Signature expiration can be used only when sandbox is created as secured."
+            )
+
         username = user
         if username is None and self._envd_version < ENVD_DEFAULT_USER:
             username = default_username
 
-        use_signature = self._envd_access_token is not None
         if use_signature:
             signature = get_signature(
                 path,
@@ -169,11 +181,16 @@ class SandboxBase:
         :return: URL for uploading file
         """
 
+        use_signature = self._envd_access_token is not None
+        if not use_signature and use_signature_expiration is not None:
+            raise InvalidArgumentException(
+                "Signature expiration can be used only when sandbox is created as secured."
+            )
+
         username = user
         if username is None and self._envd_version < ENVD_DEFAULT_USER:
             username = default_username
 
-        use_signature = self._envd_access_token is not None
         if use_signature:
             signature = get_signature(
                 path,
