@@ -1,26 +1,31 @@
-import * as tablePrinter from 'console-table-printer'
 import * as commander from 'commander'
 import * as e2b from 'e2b'
 
 import { listAliases } from '../../utils/format'
+import { renderTable } from 'src/utils/table'
 import { sortTemplatesAliases } from 'src/utils/templateSort'
-import { client, ensureAccessToken, resolveTeamId } from 'src/api'
-import { teamOption } from '../../options'
+import { client, ensureAPIKey, resolveProjectId } from 'src/api'
+import {
+  deprecatedTeamOption,
+  projectIdFromOptions,
+  projectOption,
+} from '../../options'
 import { handleE2BRequestError } from '../../utils/errors'
 
 export const listCommand = new commander.Command('list')
   .description('list sandbox templates')
   .alias('ls')
-  .addOption(teamOption)
+  .addOption(projectOption)
+  .addOption(deprecatedTeamOption)
   .option('-f, --format <format>', 'output format, eg. json, pretty')
-  .action(async (opts: { team: string; format: string }) => {
+  .action(async (opts: { project?: string; team?: string; format: string }) => {
     try {
       const format = opts.format || 'pretty'
-      ensureAccessToken()
+      ensureAPIKey()
       process.stdout.write('\n')
 
       const templates = await listSandboxTemplates({
-        teamID: resolveTeamId(opts.team),
+        projectId: resolveProjectId(projectIdFromOptions(opts)),
       })
 
       for (const template of templates) {
@@ -28,7 +33,7 @@ export const listCommand = new commander.Command('list')
       }
 
       if (format === 'pretty') {
-        renderTable(templates)
+        renderTemplateTable(templates)
       } else if (format === 'json') {
         console.log(JSON.stringify(templates, null, 2))
       } else {
@@ -41,84 +46,51 @@ export const listCommand = new commander.Command('list')
     }
   })
 
-function renderTable(templates: e2b.components['schemas']['Template'][]) {
+function renderTemplateTable(
+  templates: e2b.components['schemas']['Template'][]
+) {
   if (!templates?.length) {
     console.log('No templates found.')
     return
   }
 
-  const table = new tablePrinter.Table({
-    title: 'Sandbox templates',
-    columns: [
-      { name: 'visibility', alignment: 'left', title: 'Access' },
-      { name: 'templateID', alignment: 'left', title: 'Template ID' },
-      {
-        name: 'aliases',
-        alignment: 'left',
-        title: 'Template Name',
-        color: 'orange',
-        maxLen: 20,
-      },
-      { name: 'cpuCount', alignment: 'right', title: 'vCPUs' },
-      { name: 'memoryMB', alignment: 'right', title: 'RAM MiB' },
-      { name: 'createdBy', alignment: 'right', title: 'Created by' },
-      { name: 'createdAt', alignment: 'right', title: 'Created at' },
-      { name: 'diskSizeMB', alignment: 'right', title: 'Disk size MiB' },
-      { name: 'envdVersion', alignment: 'right', title: 'Envd version' },
-    ],
-    disabledColumns: [
-      'public',
-      'buildID',
-      'buildCount',
-      'lastSpawnedAt',
-      'spawnCount',
-      'updatedAt',
-    ],
-    rows: templates.map((template) => ({
-      ...template,
-      visibility: template.public ? 'Public' : 'Private',
-      aliases: listAliases(template.aliases),
-      createdBy: template.createdBy?.email,
-      createdAt: new Date(template.createdAt).toLocaleDateString(),
-    })),
-    style: {
-      headerTop: {
-        left: '',
-        right: '',
-        mid: '',
-        other: '',
-      },
-      headerBottom: {
-        left: '',
-        right: '',
-        mid: '',
-        other: '',
-      },
-      tableBottom: {
-        left: '',
-        right: '',
-        mid: '',
-        other: '',
-      },
-      vertical: '',
+  renderTable(templates, [
+    {
+      header: 'Access',
+      value: (template) => (template.public ? 'Public' : 'Private'),
     },
-    colorMap: {
-      orange: '\x1b[38;5;216m',
+    { header: 'Template ID', value: (template) => template.templateID },
+    {
+      header: 'Template Name',
+      value: (template) => listAliases(template.aliases),
     },
-  })
-  table.printTable()
-
-  process.stdout.write('\n')
+    { header: 'vCPUs', value: (template) => String(template.cpuCount) },
+    { header: 'RAM MiB', value: (template) => String(template.memoryMB) },
+    {
+      header: 'Created by',
+      value: (template) => template.createdBy?.email,
+    },
+    {
+      header: 'Created at',
+      value: (template) => new Date(template.createdAt).toLocaleDateString(),
+    },
+    {
+      header: 'Disk size MiB',
+      value: (template) => String(template.diskSizeMB),
+    },
+    { header: 'Envd version', value: (template) => template.envdVersion },
+  ])
 }
 
 export async function listSandboxTemplates({
-  teamID,
+  projectId,
 }: {
-  teamID?: string
+  projectId?: string
 }): Promise<e2b.components['schemas']['Template'][]> {
   const templates = await client.api.GET('/templates', {
     params: {
-      query: { teamID },
+      // the backend API still calls the project ID "teamID"
+      query: { teamID: projectId },
     },
   })
 

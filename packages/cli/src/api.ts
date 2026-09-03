@@ -1,58 +1,48 @@
 import * as boxen from 'boxen'
 import * as e2b from 'e2b'
 
+import * as packageJSON from '../package.json'
 import { getUserConfig, UserConfig } from './user'
 import { asBold, asPrimary } from './utils/format'
 
-export let apiKey = process.env.E2B_API_KEY
-export let accessToken = process.env.E2B_ACCESS_TOKEN
-export const teamId = process.env.E2B_TEAM_ID
+// Must run before any ConnectionConfig is constructed (including the
+// module-level one below) — configs read the integration at construction time.
+e2b.ConnectionConfig.setIntegration(`e2b-cli/${packageJSON.version}`)
 
-const authErrorBox = (keyName: string) => {
-  let link
-  let msg
-  switch (keyName) {
-    case 'E2B_API_KEY':
-      link = 'https://e2b.dev/dashboard?tab=keys'
-      msg = 'API key'
-      break
-    case 'E2B_ACCESS_TOKEN':
-      link = 'https://e2b.dev/dashboard?tab=personal'
-      msg = 'access token'
-      break
-  }
-  // throwing error in default in switch statement results in unreachable code,
-  // so we need to check if link and msg are defined here instead
-  if (!link || !msg) {
-    throw new Error(`Unknown key name: ${keyName}`)
-  }
-  return boxen.default(
-    `You must be logged in to use this command. Run ${asBold('e2b auth login')}.
+export type Teams =
+  e2b.paths['/teams']['get']['responses'][200]['content']['application/json']
+
+export let apiKey = process.env.E2B_API_KEY
+export const projectId = process.env.E2B_PROJECT_ID || process.env.E2B_TEAM_ID
+
+const authErrorBox = () => {
+  const body = `You must be logged in to use this command. Run ${asBold(
+    'e2b auth login'
+  )}.
 
 If you are seeing this message in CI/CD you may need to set the ${asBold(
-      `${keyName}`
-    )} environment variable.
-Visit ${asPrimary(link)} to get the ${msg}.`,
-    {
-      width: 70,
-      float: 'center',
-      padding: 0.5,
-      margin: 1,
-      borderStyle: 'round',
-      borderColor: 'redBright',
-    }
-  )
+    'E2B_API_KEY'
+  )} environment variable.
+Visit ${asPrimary('https://e2b.dev/dashboard?tab=keys')} to get the API key.`
+  return boxen.default(body, {
+    width: 70,
+    float: 'center',
+    padding: 0.5,
+    margin: 1,
+    borderStyle: 'round',
+    borderColor: 'redBright',
+  })
 }
 
 export function ensureAPIKey() {
   // If apiKey is not already set (either from env var or from user config), try to get it from config file
   if (!apiKey) {
     const userConfig = getUserConfig()
-    apiKey = userConfig?.teamApiKey
+    apiKey = userConfig?.projectApiKey
   }
 
   if (!apiKey) {
-    console.error(authErrorBox('E2B_API_KEY'))
+    console.error(authErrorBox())
     process.exit(1)
   } else {
     return apiKey
@@ -68,39 +58,19 @@ export function ensureUserConfig(): UserConfig {
   return userConfig
 }
 
-export function ensureAccessToken() {
-  // If accessToken is not already set (either from env var or from user config), try to get it from config file
-  if (!accessToken) {
-    const userConfig = getUserConfig()
-    accessToken = userConfig?.accessToken
-  }
-
-  if (!accessToken) {
-    console.error(authErrorBox('E2B_ACCESS_TOKEN'))
-    process.exit(1)
-  } else {
-    return accessToken
-  }
-}
-
 /**
- * Resolve team ID with proper precedence:
- * 1. CLI --team flag
- * 2. E2B_TEAM_ID env var
- * 3. Local e2b.toml team_id (if provided)
- * 4. ~/.e2b/config.json teamId (only if E2B_API_KEY env var is NOT set,
- *    to avoid mismatch between env var API key and config file team ID)
+ * Resolve project ID with proper precedence:
+ * 1. CLI --project flag (or the deprecated --team flag)
+ * 2. E2B_PROJECT_ID env var (or the deprecated E2B_TEAM_ID)
+ * 3. ~/.e2b/config.json projectId (only if E2B_API_KEY env var is NOT set,
+ *    to avoid mismatch between env var API key and config file project ID)
  */
-export function resolveTeamId(
-  cliTeamId?: string,
-  localConfigTeamId?: string
-): string | undefined {
-  if (cliTeamId) return cliTeamId
-  if (teamId) return teamId
-  if (localConfigTeamId) return localConfigTeamId
+export function resolveProjectId(cliProjectId?: string): string | undefined {
+  if (cliProjectId) return cliProjectId
+  if (projectId) return projectId
   if (!process.env.E2B_API_KEY) {
     const config = getUserConfig()
-    return config?.teamId
+    return config?.projectId
   }
   return undefined
 }
@@ -108,7 +78,11 @@ export function resolveTeamId(
 const userConfig = getUserConfig()
 
 export const connectionConfig = new e2b.ConnectionConfig({
-  accessToken: process.env.E2B_ACCESS_TOKEN || userConfig?.accessToken,
-  apiKey: process.env.E2B_API_KEY || userConfig?.teamApiKey,
+  apiKey: process.env.E2B_API_KEY || userConfig?.projectApiKey,
 })
-export const client = new e2b.ApiClient(connectionConfig)
+
+// `e2b auth login` runs before any API key exists, and this client is built at
+// import time, so don't require an API key here.
+export const client = new e2b.ApiClient(connectionConfig, {
+  requireApiKey: false,
+})

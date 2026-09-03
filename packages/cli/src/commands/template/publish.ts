@@ -1,26 +1,24 @@
 import * as commander from 'commander'
 import * as chalk from 'chalk'
-import * as fs from 'fs'
 
 import {
   asBold,
   asFormattedError,
   asFormattedSandboxTemplate,
-  asLocal,
-  asLocalRelative,
+  SandboxTemplateRef,
 } from 'src/utils/format'
 import {
-  configOption,
-  pathOption,
+  deprecatedConfigOption,
+  deprecatedTeamOption,
+  projectIdFromOptions,
+  projectOption,
   selectMultipleOption,
-  teamOption,
+  warnIgnoredConfigOption,
 } from 'src/options'
-import { configName, E2BConfig, getConfigPath, loadConfig } from 'src/config'
-import { getRoot } from 'src/utils/filesystem'
 import { listSandboxTemplates } from './list'
 import { getPromptTemplates } from 'src/utils/templatePrompt'
 import { confirm } from 'src/utils/confirm'
-import { client, resolveTeamId } from 'src/api'
+import { client, resolveProjectId } from 'src/api'
 import { handleE2BRequestError } from '../../utils/errors'
 
 async function publishTemplate(templateID: string, publish: boolean) {
@@ -47,31 +45,29 @@ async function templateAction(
   publish: boolean,
   template: string,
   opts: {
-    path?: string
-    config?: string
     yes?: boolean
     select?: boolean
+    project?: string
     team?: string
+    config?: string
   }
 ) {
   try {
-    let teamId = opts.team
+    warnIgnoredConfigOption(opts)
 
-    const root = getRoot(opts.path)
+    let projectId = projectIdFromOptions(opts)
 
-    const templates: (Pick<E2BConfig, 'template_id'> & {
-      configPath?: string
-    })[] = []
+    const templates: SandboxTemplateRef[] = []
 
     if (template) {
       templates.push({
-        template_id: template,
+        templateID: template,
       })
     } else if (opts.select) {
-      teamId = resolveTeamId(teamId)
+      projectId = resolveProjectId(projectId)
 
       const allTemplates = await listSandboxTemplates({
-        teamID: teamId,
+        projectId,
       })
 
       const filteredTemplates = allTemplates.filter(
@@ -93,8 +89,8 @@ async function templateAction(
       )
       templates.push(
         ...selectedTemplates.map((e) => ({
-          template_id: e.templateID,
-          ...e,
+          templateID: e.templateID,
+          aliases: e.aliases,
         }))
       )
 
@@ -102,27 +98,6 @@ async function templateAction(
         console.log('No sandbox templates selected')
         return
       }
-    } else {
-      const configPath = getConfigPath(root, opts.config)
-      const config = fs.existsSync(configPath)
-        ? await loadConfig(configPath)
-        : undefined
-
-      if (!config) {
-        console.log(
-          `No ${asLocal(configName)} found in ${asLocalRelative(
-            root
-          )}. Specify sandbox template with ${asBold(
-            '[template]'
-          )} argument or use interactive mode with ${asBold('-s')} flag.`
-        )
-        return
-      }
-
-      templates.push({
-        ...config,
-        configPath,
-      })
     }
 
     if (!templates || templates.length === 0) {
@@ -139,14 +114,7 @@ async function templateAction(
         `Sandbox templates to ${publish ? 'publish' : 'unpublish'}`
       )
     )
-    templates.forEach((e) =>
-      console.log(
-        asFormattedSandboxTemplate(
-          { ...e, templateID: e.template_id },
-          e.configPath
-        )
-      )
-    )
+    templates.forEach((e) => console.log(asFormattedSandboxTemplate(e)))
     process.stdout.write('\n')
 
     if (!opts.yes) {
@@ -157,8 +125,8 @@ async function templateAction(
           templates.length === 1 ? 'template' : 'templates'
         } ${
           publish
-            ? 'public to everyone outside your team'
-            : 'private to your team'
+            ? 'public to everyone outside your project'
+            : 'private to your project'
         }`
       )
 
@@ -173,12 +141,9 @@ async function templateAction(
         console.log(
           `- ${
             publish ? 'Publishing' : 'Unpublishing'
-          } sandbox template ${asFormattedSandboxTemplate(
-            { ...e, templateID: e.template_id },
-            e.configPath
-          )}`
+          } sandbox template ${asFormattedSandboxTemplate(e)}`
         )
-        const names = await publishTemplate(e.template_id, publish)
+        const names = await publishTemplate(e.templateID, publish)
         if (publish && names.length > 0) {
           console.log(`  Published as: ${asBold(names.join(', '))}`)
         }
@@ -197,16 +162,12 @@ export const publishCommand = new commander.Command('publish')
     '[template]',
     `specify ${asBold(
       '[template]'
-    )} to publish it. If you dont specify ${asBold(
-      '[template]'
-    )} the command will try to publish sandbox template defined by ${asLocal(
-      'e2b.toml'
-    )}.`
+    )} to publish it, or select templates interactively with ${asBold('-s')}`
   )
-  .addOption(pathOption)
-  .addOption(configOption)
   .addOption(selectMultipleOption)
-  .addOption(teamOption)
+  .addOption(projectOption)
+  .addOption(deprecatedTeamOption)
+  .addOption(deprecatedConfigOption)
   .alias('pb')
   .option('-y, --yes', 'skip manual publish confirmation')
   .action(templateAction.bind(null, true))
@@ -217,16 +178,12 @@ export const unPublishCommand = new commander.Command('unpublish')
     '[template]',
     `specify ${asBold(
       '[template]'
-    )} to unpublish it. If you don't specify ${asBold(
-      '[template]'
-    )} the command will try to unpublish sandbox template defined by ${asLocal(
-      'e2b.toml'
-    )}.`
+    )} to unpublish it, or select templates interactively with ${asBold('-s')}`
   )
-  .addOption(pathOption)
-  .addOption(configOption)
   .addOption(selectMultipleOption)
-  .addOption(teamOption)
+  .addOption(projectOption)
+  .addOption(deprecatedTeamOption)
+  .addOption(deprecatedConfigOption)
   .alias('upb')
   .option('-y, --yes', 'skip manual unpublish confirmation')
   .action(templateAction.bind(null, false))

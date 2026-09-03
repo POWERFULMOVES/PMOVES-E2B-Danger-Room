@@ -197,6 +197,7 @@ export type Instruction = {
   forceUpload?: true
   filesHash?: string
   resolveSymlinks?: boolean
+  gzip?: boolean
 }
 
 /**
@@ -209,6 +210,7 @@ export type CopyItem = {
   user?: string
   mode?: number
   resolveSymlinks?: boolean
+  gzip?: boolean
 }
 
 /**
@@ -242,6 +244,42 @@ export interface TemplateFromImage {
    * ```
    */
   fromUbuntuImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from a Fedora-based Docker image.
+   * @param variant Fedora variant (default: '44')
+   *
+   * @example
+   * ```ts
+   * Template().fromFedoraImage('44')
+   * ```
+   */
+  fromFedoraImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from an Alpine-based Docker image.
+   * @param variant Alpine variant (default: '3.24')
+   *
+   * @example
+   * ```ts
+   * Template().fromAlpineImage('3.24')
+   * ```
+   */
+  fromAlpineImage(variant?: string): TemplateBuilder
+
+  /**
+   * Start from an Arch Linux-based Docker image.
+   *
+   * Defaults to `latest`: Arch is a rolling release and template provisioning
+   * runs `pacman -Syu`, so pinning a tag would not change the built result.
+   * @param variant Arch Linux variant (default: 'latest')
+   *
+   * @example
+   * ```ts
+   * Template().fromArchImage('base-devel')
+   * ```
+   */
+  fromArchImage(variant?: string): TemplateBuilder
 
   /**
    * Start from a Python-based Docker image.
@@ -412,6 +450,7 @@ export interface TemplateBuilder {
       user?: string
       mode?: number
       resolveSymlinks?: boolean
+      gzip?: boolean
     }
   ): TemplateBuilder
 

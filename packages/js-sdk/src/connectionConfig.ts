@@ -22,11 +22,12 @@ export interface ConnectionOpts {
    */
   apiKey?: string
   /**
-   * E2B access token to use for authentication.
+   * Whether to validate the format of the E2B API key on the client side.
    *
-   * @default E2B_ACCESS_TOKEN // environment variable
+   * @deprecated The API key format is no longer validated on the client side;
+   * this option has no effect.
    */
-  accessToken?: string
+  validateApiKey?: boolean
   /**
    * Domain to use for the API.
    *
@@ -70,6 +71,14 @@ export interface ConnectionOpts {
   headers?: Record<string, string>
 
   /**
+   * Proxy URL to use for requests. In case of a sandbox it applies to all
+   * requests made to the returned sandbox.
+   *
+   * @example 'http://user:pass@127.0.0.1:8080'
+   */
+  proxy?: string
+
+  /**
    * Additional headers to send with E2B API requests.
    */
   apiHeaders?: Record<string, string>
@@ -83,6 +92,13 @@ export interface ConnectionOpts {
 }
 
 /**
+ * Options accepted by `ConnectionConfig`.
+ *
+ * @deprecated Use `ConnectionOpts` instead.
+ */
+export type ConnectionConfigOpts = ConnectionOpts
+
+/**
  * Build an `AbortSignal` that combines an optional request-timeout signal
  * (via `AbortSignal.timeout`) with an optional user-provided signal.
  *
@@ -94,6 +110,7 @@ export function buildRequestSignal(
   requestTimeoutMs: number | undefined,
   userSignal: AbortSignal | undefined
 ): AbortSignal | undefined {
+  // `0` (and `undefined`) disable the request timeout.
   const timeoutSignal = requestTimeoutMs
     ? AbortSignal.timeout(requestTimeoutMs)
     : undefined
@@ -133,10 +150,10 @@ export function setupRequestController(
 } {
   const controller = new AbortController()
 
-  const onUserAbort = () => controller.abort(userSignal?.reason)
+  const onUserAbort = () => abortWithReason(controller, userSignal?.reason)
   if (userSignal) {
     if (userSignal.aborted) {
-      controller.abort(userSignal.reason)
+      abortWithReason(controller, userSignal.reason)
     } else {
       userSignal.addEventListener('abort', onUserAbort, { once: true })
     }
@@ -145,7 +162,8 @@ export function setupRequestController(
   let reqTimeout: ReturnType<typeof setTimeout> | undefined = requestTimeoutMs
     ? setTimeout(
         () =>
-          controller.abort(
+          abortWithReason(
+            controller,
             new DOMException(
               `Request handshake timed out after ${requestTimeoutMs}ms`,
               'TimeoutError'
@@ -175,10 +193,213 @@ export function setupRequestController(
 }
 
 /**
+ * Create a resettable idle-timeout that aborts `controller` when no progress is
+ * made within `idleTimeoutMs`. `arm` (re)starts the timer; call it on each
+ * chunk. `clear` stops it. `0`/`undefined` disables it (both are no-ops).
+ *
+ * @internal
+ */
+function createIdleAbort(
+  controller: AbortController,
+  idleTimeoutMs: number | undefined,
+  label: string
+): { arm: () => void; clear: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const clear = () => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = undefined
+    }
+  }
+  const arm = () => {
+    if (!idleTimeoutMs) return
+    clear()
+    timer = setTimeout(
+      () =>
+        abortWithReason(
+          controller,
+          new DOMException(
+            `${label} idle for ${idleTimeoutMs}ms`,
+            'TimeoutError'
+          )
+        ),
+      idleTimeoutMs
+    )
+  }
+  return { arm, clear }
+}
+
+/**
+ * Abort with the reason pinned to the controller. Bun (observed on 1.3.14)
+ * holds `signal.reason` weakly: a reason that nothing else strongly
+ * references — e.g. a `DOMException` constructed inside a timer callback —
+ * can be garbage-collected, leaving `signal.reason` undefined by the time a
+ * consumer reads it. Pinning the reason to the controller keeps it alive for
+ * the signal's lifetime. No-op cost on other runtimes.
+ *
+ * @internal
+ */
+function abortWithReason(controller: AbortController, reason: unknown) {
+  // A second abort is a spec-level no-op and must not overwrite the pin that
+  // keeps the committed (winning) reason alive.
+  if (controller.signal.aborted) return
+  ;(controller as { __e2bAbortReason?: unknown }).__e2bAbortReason = reason
+  controller.abort(reason)
+}
+
+/**
+ * Wrap a streaming response body so its pooled connection is released when the
+ * stream is fully read, cancelled, errors, or stays idle for too long.
+ *
+ * Clears the handshake timeout from {@link setupRequestController} (so
+ * consuming the body isn't killed by it) and replaces it with an idle-read
+ * timeout that bounds only the wire: it's armed while waiting on a network
+ * read and cleared the moment a chunk arrives, so a slow or paused consumer
+ * never trips it (only a server that stops sending mid-stream does). On expiry
+ * it aborts `controller`, tearing down the fetch and releasing the connection.
+ * Pass `0`/`undefined` to disable. Call once the handshake has succeeded.
+ *
+ * @internal
+ */
+export function wrapStreamWithConnectionCleanup(
+  body: ReadableStream<Uint8Array> | null,
+  {
+    clearStartTimeout,
+    cleanup,
+    controller,
+    idleTimeoutMs,
+  }: {
+    clearStartTimeout: () => void
+    cleanup: () => void
+    controller: AbortController
+    idleTimeoutMs?: number
+  }
+): ReadableStream<Uint8Array> {
+  clearStartTimeout()
+
+  if (!body) {
+    cleanup()
+    return new Blob([]).stream()
+  }
+
+  const reader = body.getReader()
+  const idle = createIdleAbort(controller, idleTimeoutMs, 'Stream')
+
+  // Idempotent: safe to call from multiple stream callbacks — cancelling
+  // while a pull is in flight settles both paths (the pending read resolves
+  // `done` after `reader.cancel()`), which must not release twice.
+  let released = false
+  const release = () => {
+    if (released) {
+      return
+    }
+    released = true
+    idle.clear()
+    cleanup()
+  }
+
+  return new ReadableStream<Uint8Array>({
+    async pull(streamController) {
+      // Bound only the wire: arm before reading from the network and clear the
+      // moment a chunk (or EOF) arrives, so a slow or paused consumer never
+      // counts against the idle timeout. A consumer that holds the stream but
+      // stops reading is never pulled here, so nothing arms—that case is
+      // reclaimed server-side, not by this timer.
+      idle.arm()
+      try {
+        const { done, value } = await reader.read()
+        idle.clear()
+        if (done) {
+          release()
+          streamController.close()
+        } else {
+          streamController.enqueue(value)
+        }
+      } catch (err) {
+        release()
+        streamController.error(err)
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason)
+      } finally {
+        release()
+      }
+    },
+  })
+}
+
+/**
  * Configuration for connecting to the API.
  */
 export class ConnectionConfig {
   public static envdPort = 49983
+
+  private static integration?: string
+
+  private static readonly sdkUserAgentPrefix = 'e2b-js-sdk/'
+
+  private static getRequestSource() {
+    const source = getEnvVar('E2B_USER_AGENT_SOURCE')
+    return source && /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(source)
+      ? source
+      : undefined
+  }
+
+  private static buildUserAgent(requestSource?: string) {
+    const userAgentParts = [`${ConnectionConfig.sdkUserAgentPrefix}${version}`]
+
+    if (ConnectionConfig.integration) {
+      userAgentParts.push(ConnectionConfig.integration)
+    }
+
+    if (requestSource) {
+      userAgentParts.push(`source/${requestSource}`)
+    }
+
+    return userAgentParts.join(' ')
+  }
+
+  /**
+   * Set the `User-Agent` on `headers`: an explicitly provided value always
+   * wins; otherwise the SDK-built one, tagged with the current integration.
+   *
+   * An SDK-built value carried over from an earlier config (configs are
+   * rebuilt via `new ConnectionConfig({ ...config })`) is recognized by its
+   * prefix and rebuilt, so it stays in sync with the current integration.
+   */
+  private static applyUserAgent(
+    headers: Record<string, string>,
+    requestSource?: string
+  ) {
+    const userAgent = headers['User-Agent']
+
+    if (
+      userAgent !== undefined &&
+      !userAgent.startsWith(ConnectionConfig.sdkUserAgentPrefix)
+    ) {
+      return
+    }
+
+    headers['User-Agent'] = ConnectionConfig.buildUserAgent(requestSource)
+  }
+
+  /**
+   * Identify traffic from an integration wrapping the E2B SDK by appending
+   * `integration` (e.g. `'e2b-code-interpreter/0.1.0'`) to the `User-Agent`
+   * header of every request.
+   *
+   * Call once at startup, before any `ConnectionConfig` is constructed —
+   * configs read the value at construction time. Pass `undefined` to clear.
+   *
+   * @internal
+   * @hidden
+   * @hide
+   */
+  static setIntegration(integration: string | undefined) {
+    ConnectionConfig.integration = integration
+  }
 
   readonly debug: boolean
   readonly domain: string
@@ -189,19 +410,36 @@ export class ConnectionConfig {
   readonly requestTimeoutMs: number
 
   readonly apiKey?: string
-  readonly accessToken?: string
+  /**
+   * @deprecated The API key format is no longer validated on the client side;
+   * this option has no effect.
+   */
+  readonly validateApiKey?: boolean
 
   readonly headers?: Record<string, string>
 
+  /**
+   * Validated traffic source used for request correlation.
+   *
+   * @internal
+   * @hidden
+   * @hide
+   */
+  readonly requestSource?: string
+
+  readonly proxy?: string
+
   constructor(opts?: ConnectionOpts) {
     this.apiKey = opts?.apiKey || ConnectionConfig.apiKey
-    this.debug = opts?.debug || ConnectionConfig.debug
+    this.validateApiKey = opts?.validateApiKey
+    this.debug = opts?.debug ?? ConnectionConfig.debug
     this.domain = opts?.domain || ConnectionConfig.domain
-    this.accessToken = opts?.accessToken || ConnectionConfig.accessToken
     this.requestTimeoutMs = opts?.requestTimeoutMs ?? REQUEST_TIMEOUT_MS
     this.logger = opts?.logger
+    this.requestSource = ConnectionConfig.getRequestSource()
     this.headers = { ...(opts?.headers ?? {}), ...(opts?.apiHeaders ?? {}) }
-    this.headers['User-Agent'] = `e2b-js-sdk/${version}`
+    ConnectionConfig.applyUserAgent(this.headers, this.requestSource)
+    this.proxy = opts?.proxy
 
     this.apiUrl =
       opts?.apiUrl ||
@@ -209,6 +447,43 @@ export class ConnectionConfig {
       (this.debug ? 'http://localhost:3000' : `https://api.${this.domain}`)
 
     this.sandboxUrl = opts?.sandboxUrl || ConnectionConfig.sandboxUrl
+  }
+
+  /**
+   * Merge connection options bound to a class (e.g. by an `E2B` client) with
+   * the per-call options. Per-call options win, then the bound options, then
+   * the environment variables resolved by the `ConnectionConfig` constructor.
+   *
+   * Explicitly `undefined` per-call values are dropped so they fall back to the
+   * bound options instead of clearing them.
+   *
+   * @internal
+   * @hidden
+   * @hide
+   */
+  static mergeOpts<T extends ConnectionOpts>(
+    boundOpts: ConnectionOpts | undefined,
+    opts?: T
+  ): T | undefined {
+    if (!boundOpts) {
+      return opts
+    }
+
+    const merged: Record<string, unknown> = { ...boundOpts }
+    for (const [key, value] of Object.entries(opts ?? {})) {
+      if (value !== undefined) {
+        // `defineProperty` so a `__proto__` key (e.g. from parsed JSON) becomes
+        // a plain own property instead of changing the prototype.
+        Object.defineProperty(merged, key, {
+          value,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        })
+      }
+    }
+
+    return merged as T
   }
 
   private static get domain() {
@@ -229,10 +504,6 @@ export class ConnectionConfig {
 
   private static get apiKey() {
     return getEnvVar('E2B_API_KEY')
-  }
-
-  private static get accessToken() {
-    return getEnvVar('E2B_ACCESS_TOKEN')
   }
 
   getSignal(requestTimeoutMs?: number, signal?: AbortSignal) {
@@ -282,6 +553,44 @@ export class ConnectionConfig {
     }
 
     return `${port}-${sandboxId}.${sandboxDomain ?? this.domain}`
+  }
+}
+
+/**
+ * Base class for the resource classes (`Sandbox`, `Volume`, `Template`,
+ * `Secret`) whose static methods build a `ConnectionConfig` from per-call
+ * options. An {@link E2B} client exposes subclasses of these with its own
+ * options bound, and every static method resolves them through
+ * {@link ClientFactory.resolveOpts}.
+ *
+ * @internal
+ * @hidden
+ * @hide
+ */
+export class ClientFactory {
+  /**
+   * Connection options bound to this class by an {@link E2B} client.
+   *
+   * Empty on the base classes, so the env-configured default path is unchanged.
+   *
+   * @internal
+   * @hidden
+   * @hide
+   */
+  protected static readonly boundOpts?: Omit<ConnectionOpts, 'signal'>
+
+  /**
+   * Merge the connection options bound to this class with the per-call options,
+   * with the per-call options taking precedence.
+   *
+   * @internal
+   * @hidden
+   * @hide
+   */
+  protected static resolveOpts<T extends ConnectionOpts>(
+    opts?: T
+  ): T | undefined {
+    return ConnectionConfig.mergeOpts(this.boundOpts, opts)
   }
 }
 

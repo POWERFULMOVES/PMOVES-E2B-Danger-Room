@@ -1,5 +1,7 @@
 import pytest
-from e2b import Sandbox
+from e2b import Sandbox, SandboxException
+
+pytestmark = pytest.mark.timeout(120)
 
 
 @pytest.mark.skip_debug()
@@ -95,6 +97,27 @@ def test_list_snapshots_for_sandbox(sandbox: Sandbox):
 
 
 @pytest.mark.skip_debug()
+def test_list_snapshots_filtered_by_name(sandbox: Sandbox, sandbox_test_id: str):
+    snapshot_name = f"snap-filter-{sandbox_test_id}"
+
+    snapshot = sandbox.create_snapshot(name=snapshot_name)
+
+    try:
+        paginator = Sandbox.list_snapshots(name=snapshot_name)
+        snapshots = paginator.next_items()
+
+        found = any(s.snapshot_id == snapshot.snapshot_id for s in snapshots)
+        assert found
+
+        empty_paginator = Sandbox.list_snapshots(name=f"{snapshot_name}-does-not-exist")
+        empty_snapshots = empty_paginator.next_items()
+        assert isinstance(empty_snapshots, list)
+        assert len(empty_snapshots) == 0
+    finally:
+        Sandbox.delete_snapshot(snapshot.snapshot_id)
+
+
+@pytest.mark.skip_debug()
 def test_create_named_snapshot(sandbox: Sandbox, sandbox_test_id: str):
     snapshot_name = f"snap-{sandbox_test_id}"
 
@@ -121,6 +144,7 @@ def test_delete_snapshot(sandbox: Sandbox):
 
 
 @pytest.mark.skip_debug()
+@pytest.mark.timeout(180)
 def test_snapshot_preserves_filesystem(sandbox: Sandbox):
     app_dir = "/home/user/app"
     config_path = f"{app_dir}/config.json"
@@ -135,7 +159,14 @@ def test_snapshot_preserves_filesystem(sandbox: Sandbox):
     snapshot = sandbox.create_snapshot()
 
     try:
-        new_sandbox = Sandbox.create(snapshot.snapshot_id)
+        try:
+            new_sandbox = Sandbox.create(snapshot.snapshot_id)
+        except SandboxException as error:
+            # Placement can transiently time out while the snapshot is restored.
+            # Retry only the backend response that explicitly asks the caller to do so.
+            if "Failed to place sandbox: placement timed out" not in str(error):
+                raise
+            new_sandbox = Sandbox.create(snapshot.snapshot_id)
 
         try:
             dir_exists = new_sandbox.files.exists(app_dir)

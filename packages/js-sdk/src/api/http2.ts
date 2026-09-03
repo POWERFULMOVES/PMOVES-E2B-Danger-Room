@@ -1,11 +1,9 @@
 import { runtime } from '../utils'
 import { parseInflightLimitEnv, parsePositiveIntEnv } from './metadata'
-import { limitConcurrency } from './inflight'
 import {
-  loadUndici,
-  toUndiciRequestInput,
+  buildDispatchedFetch,
+  createRuntimeFetch,
   type UndiciModule,
-  type UndiciRequestInit,
 } from '../undici'
 
 const DEFAULT_API_CONNECTION_LIMIT = 100
@@ -13,14 +11,20 @@ const DEFAULT_API_CONNECTION_LIMIT = 100
 // Override via env if your workload needs different.
 const DEFAULT_API_INFLIGHT_LIMIT = 1000
 
-let apiFetch: typeof fetch | undefined
+// Fetchers are cached per proxy so requests without a proxy keep sharing a
+// single dispatcher while each distinct proxy URL gets its own.
+const apiFetchers = new Map<string, typeof fetch>()
 
-export function createApiFetch(): typeof fetch {
-  if (apiFetch) {
-    return apiFetch
+export function createApiFetch(proxy?: string): typeof fetch {
+  const key = proxy ?? ''
+
+  const cached = apiFetchers.get(key)
+  if (cached) {
+    return cached
   }
 
-  apiFetch = createApiFetchForRuntime(runtime)
+  const apiFetch = createApiFetchForRuntime(runtime, { proxy })
+  apiFetchers.set(key, apiFetch)
 
   return apiFetch
 }
@@ -30,55 +34,20 @@ export function createApiFetchForRuntime(
   options: {
     connectionLimit?: number
     inflightLimit?: number
+    proxy?: string
     loadUndici?: () => Promise<UndiciModule | undefined>
   } = {}
 ): typeof fetch {
-  if (currentRuntime !== 'node') {
-    return fetch
-  }
-
-  let fetcherPromise: Promise<typeof fetch> | undefined
-
-  return (async (input, init) => {
-    fetcherPromise ??= buildApiFetcher(options)
-    const fetcher = await fetcherPromise
-
-    return fetcher(input, init)
-  }) as typeof fetch
-}
-
-async function buildApiFetcher(options: {
-  connectionLimit?: number
-  inflightLimit?: number
-  loadUndici?: () => Promise<UndiciModule | undefined>
-}): Promise<typeof fetch> {
-  const undici = await (options.loadUndici ?? loadUndici)()
-  const inflightLimit = options.inflightLimit ?? getApiInflightLimit()
-
-  if (!undici) {
-    return limitConcurrency(fetch, inflightLimit)
-  }
-
-  const { Agent, fetch: undiciFetch } = undici
-  const dispatcher = new Agent({
-    allowH2: true,
-    connections: options.connectionLimit ?? getApiConnectionLimit(),
-  })
-  const fetchWithDispatcher = undiciFetch as unknown as (
-    input: RequestInfo | URL,
-    init?: UndiciRequestInit
-  ) => Promise<Response>
-
-  const wrapped: typeof fetch = ((input, init) => {
-    const request = toUndiciRequestInput(input, init)
-
-    return fetchWithDispatcher(request.input, {
-      ...request.init,
-      dispatcher,
+  // Defaults resolve inside the thunk so env vars are read lazily, at the
+  // first request rather than at factory creation.
+  return createRuntimeFetch(currentRuntime, () =>
+    buildDispatchedFetch({
+      connections: options.connectionLimit ?? getApiConnectionLimit(),
+      inflightLimit: options.inflightLimit ?? getApiInflightLimit(),
+      proxy: options.proxy,
+      loadUndici: options.loadUndici,
     })
-  }) as typeof fetch
-
-  return limitConcurrency(wrapped, inflightLimit)
+  )
 }
 
 export function getApiConnectionLimit(): number {
@@ -92,7 +61,7 @@ export function getApiConnectionLimit(): number {
  * Returns the configured max number of API requests that can be in flight at
  * once, or `0` to disable the cap.
  *
- * Defaults to {@link DEFAULT_API_INFLIGHT_LIMIT} ({@link 1000}). Override via
+ * Defaults to `1000` ({@link DEFAULT_API_INFLIGHT_LIMIT}). Override via
  * `E2B_API_INFLIGHT_REQUESTS` env var; set to `0` to disable the cap entirely.
  */
 export function getApiInflightLimit(): number {

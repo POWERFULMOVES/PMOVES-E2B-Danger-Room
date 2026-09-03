@@ -2,6 +2,7 @@ import { assert, test, beforeEach, afterEach } from 'vitest'
 import {
   ConnectionConfig,
   setupRequestController,
+  wrapStreamWithConnectionCleanup,
 } from '../src/connectionConfig'
 
 // Store original env vars to restore after tests
@@ -13,6 +14,7 @@ beforeEach(() => {
     E2B_DOMAIN: process.env.E2B_DOMAIN,
     E2B_SANDBOX_URL: process.env.E2B_SANDBOX_URL,
     E2B_DEBUG: process.env.E2B_DEBUG,
+    E2B_USER_AGENT_SOURCE: process.env.E2B_USER_AGENT_SOURCE,
   }
 })
 
@@ -25,6 +27,9 @@ afterEach(() => {
       process.env[key] = originalEnv[key]
     }
   })
+
+  // Clear the process-wide integration attribution
+  ConnectionConfig.setIntegration(undefined)
 })
 
 test('api_url defaults correctly', () => {
@@ -146,6 +151,117 @@ test('sandbox_url stays localhost in debug mode', () => {
   )
 })
 
+test('debug false in args overrides E2B_DEBUG env var', () => {
+  process.env.E2B_DEBUG = 'true'
+
+  const config = new ConnectionConfig({ debug: false })
+  assert.equal(config.debug, false)
+})
+
+test('debug defaults to E2B_DEBUG env var', () => {
+  process.env.E2B_DEBUG = 'true'
+
+  const config = new ConnectionConfig()
+  assert.equal(config.debug, true)
+})
+
+test('setIntegration appends the integration to the user agent', () => {
+  ConnectionConfig.setIntegration('testing/version')
+  const config = new ConnectionConfig()
+
+  assert.equal(config.headers?.['User-Agent']?.startsWith('e2b-js-sdk/'), true)
+  assert.include(config.headers?.['User-Agent']?.split(' '), 'testing/version')
+})
+
+test('user agent includes the configured traffic source', () => {
+  process.env.E2B_USER_AGENT_SOURCE = 'ci'
+
+  const config = new ConnectionConfig()
+
+  assert.equal(config.headers?.['User-Agent']?.endsWith(' source/ci'), true)
+})
+
+test('user agent ignores an unsafe traffic source', () => {
+  process.env.E2B_USER_AGENT_SOURCE = 'ci bad\nheader'
+
+  const config = new ConnectionConfig()
+
+  assert.equal(config.headers?.['User-Agent']?.includes('source/'), false)
+})
+
+test('integration survives config rebuilds', () => {
+  ConnectionConfig.setIntegration('testing/version')
+  const config = new ConnectionConfig()
+  const rebuiltConfig = new ConnectionConfig({ ...config })
+
+  assert.include(
+    rebuiltConfig.headers?.['User-Agent']?.split(' '),
+    'testing/version'
+  )
+})
+
+test('setIntegration does not retro-tag configs built earlier', () => {
+  const before = new ConnectionConfig()
+  ConnectionConfig.setIntegration('testing/version')
+  const after = new ConnectionConfig()
+
+  assert.equal(before.headers?.['User-Agent']?.includes('testing'), false)
+  assert.include(after.headers?.['User-Agent']?.split(' '), 'testing/version')
+})
+
+test('clearing the integration restores the plain user agent', () => {
+  ConnectionConfig.setIntegration('testing/version')
+  ConnectionConfig.setIntegration(undefined)
+  const config = new ConnectionConfig()
+
+  assert.equal(config.headers?.['User-Agent']?.startsWith('e2b-js-sdk/'), true)
+  assert.equal(config.headers?.['User-Agent']?.includes('testing'), false)
+})
+
+test('custom user agent is preserved without integration', () => {
+  const config = new ConnectionConfig({
+    apiHeaders: { 'User-Agent': 'my-app/1.0' },
+  })
+
+  assert.equal(config.headers?.['User-Agent'], 'my-app/1.0')
+})
+
+test('custom user agent wins over integration', () => {
+  ConnectionConfig.setIntegration('testing/version')
+
+  const config = new ConnectionConfig({
+    headers: { 'User-Agent': 'my-app/1.0' },
+  })
+
+  assert.equal(config.headers?.['User-Agent'], 'my-app/1.0')
+})
+
+test('custom user agent survives config rebuilds', () => {
+  ConnectionConfig.setIntegration('testing/version')
+  const config = new ConnectionConfig({
+    apiHeaders: { 'User-Agent': 'my-app/1.0' },
+  })
+  const rebuiltConfig = new ConnectionConfig({ ...config })
+
+  assert.equal(rebuiltConfig.headers?.['User-Agent'], 'my-app/1.0')
+})
+
+test('clearing the integration propagates to config rebuilds', () => {
+  ConnectionConfig.setIntegration('testing/version')
+  const config = new ConnectionConfig()
+  ConnectionConfig.setIntegration(undefined)
+  const rebuiltConfig = new ConnectionConfig({ ...config })
+
+  assert.equal(
+    rebuiltConfig.headers?.['User-Agent']?.startsWith('e2b-js-sdk/'),
+    true
+  )
+  assert.equal(
+    rebuiltConfig.headers?.['User-Agent']?.includes('testing'),
+    false
+  )
+})
+
 test('getSignal returns user signal when no timeout is set', () => {
   const config = new ConnectionConfig({ requestTimeoutMs: 0 })
   const controller = new AbortController()
@@ -174,6 +290,31 @@ test('getSignal returns undefined when no timeout and no signal', () => {
   const config = new ConnectionConfig({ requestTimeoutMs: 0 })
   const signal = config.getSignal(0)
   assert.equal(signal, undefined)
+})
+
+test('requestTimeoutMs 0 from the config disables the timeout', () => {
+  const config = new ConnectionConfig({ requestTimeoutMs: 0 })
+  // The stored value is kept as 0 (not replaced by the default).
+  assert.equal(config.requestTimeoutMs, 0)
+  // getSignal() with no per-call arg falls back to the stored 0, which must
+  // NOT produce a timeout signal.
+  assert.equal(config.getSignal(), undefined)
+  // With only a user signal, no timeout signal is layered on top.
+  const controller = new AbortController()
+  assert.strictEqual(
+    config.getSignal(undefined, controller.signal),
+    controller.signal
+  )
+})
+
+test('setupRequestController with config timeout 0 never auto-aborts', async () => {
+  const config = new ConnectionConfig({ requestTimeoutMs: 0 })
+  const { controller } = setupRequestController(
+    config.requestTimeoutMs,
+    undefined
+  )
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  assert.equal(controller.signal.aborted, false)
 })
 
 test('setupRequestController aborts when user signal aborts', () => {
@@ -235,6 +376,21 @@ test('setupRequestController handshake timeout aborts with TimeoutError reason',
   assert.equal((controller.signal.reason as DOMException).name, 'TimeoutError')
 })
 
+test('setupRequestController keeps the winning abort reason when a later abort races', async () => {
+  const userController = new AbortController()
+  const { controller } = setupRequestController(20, userController.signal)
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  assert.equal(controller.signal.aborted, true)
+
+  // A user abort arriving after the timeout already aborted must not disturb
+  // the committed reason (on Bun: nor steal the pin keeping it alive).
+  userController.abort(new Error('user cancel'))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  assert.ok(controller.signal.reason instanceof DOMException)
+  assert.equal((controller.signal.reason as DOMException).name, 'TimeoutError')
+})
+
 test('setupRequestController user signal still cancels after clearStartTimeout', () => {
   const userController = new AbortController()
   const { controller, clearStartTimeout } = setupRequestController(
@@ -245,4 +401,172 @@ test('setupRequestController user signal still cancels after clearStartTimeout',
   assert.equal(controller.signal.aborted, false)
   userController.abort()
   assert.equal(controller.signal.aborted, true)
+})
+
+// Builds a source ReadableStream that records whether its underlying reader was
+// cancelled, standing in for a fetch response body backed by a pooled
+// connection. `cancel` being invoked is what releases that connection.
+function trackedSource() {
+  const state: { cancelled: boolean; cancelReason: unknown } = {
+    cancelled: false,
+    cancelReason: undefined,
+  }
+  const chunks = ['a', 'b'].map((s) => new TextEncoder().encode(s))
+  let i = 0
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (i < chunks.length) {
+        controller.enqueue(chunks[i++])
+      } else {
+        controller.close()
+      }
+    },
+    cancel(reason) {
+      state.cancelled = true
+      state.cancelReason = reason
+    },
+  })
+  return { body, state }
+}
+
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader()
+  let out = ''
+  const decoder = new TextDecoder()
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    out += decoder.decode(value, { stream: true })
+  }
+  return out
+}
+
+// Builds a source ReadableStream that never produces a chunk and errors its
+// pending read when `signal` aborts, standing in for a stalled fetch response
+// body whose connection is torn down by aborting the request controller.
+function stallingSource(signal: AbortSignal) {
+  const state: { cancelled: boolean } = { cancelled: false }
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      signal.addEventListener('abort', () => controller.error(signal.reason), {
+        once: true,
+      })
+    },
+    cancel() {
+      state.cancelled = true
+    },
+  })
+  return { body, state }
+}
+
+test('wrapStreamWithConnectionCleanup releases once on full read', async () => {
+  const { body } = trackedSource()
+  let cleanups = 0
+  const stream = wrapStreamWithConnectionCleanup(body, {
+    clearStartTimeout: () => {},
+    cleanup: () => {
+      cleanups++
+    },
+    controller: new AbortController(),
+  })
+  assert.equal(await readAll(stream), 'ab')
+  assert.equal(cleanups, 1)
+})
+
+test('wrapStreamWithConnectionCleanup cancel cancels the underlying reader', async () => {
+  const { body, state } = trackedSource()
+  let cleanups = 0
+  const stream = wrapStreamWithConnectionCleanup(body, {
+    clearStartTimeout: () => {},
+    cleanup: () => {
+      cleanups++
+    },
+    controller: new AbortController(),
+  })
+  await stream.cancel('done')
+  assert.equal(state.cancelled, true)
+  assert.equal(state.cancelReason, 'done')
+  assert.equal(cleanups, 1)
+})
+
+test('wrapStreamWithConnectionCleanup handles a null body', async () => {
+  let cleanups = 0
+  let cleared = 0
+  const stream = wrapStreamWithConnectionCleanup(null, {
+    clearStartTimeout: () => {
+      cleared++
+    },
+    cleanup: () => {
+      cleanups++
+    },
+    controller: new AbortController(),
+  })
+  assert.equal(cleared, 1)
+  assert.equal(cleanups, 1)
+  assert.equal(await readAll(stream), '')
+})
+
+test('wrapStreamWithConnectionCleanup aborts and releases an idle stream', async () => {
+  const controller = new AbortController()
+  const { body } = stallingSource(controller.signal)
+  let cleanups = 0
+  const stream = wrapStreamWithConnectionCleanup(body, {
+    clearStartTimeout: () => {},
+    cleanup: () => {
+      cleanups++
+    },
+    controller,
+    idleTimeoutMs: 20,
+  })
+
+  // No chunk ever arrives, so the idle timer fires, aborts the controller,
+  // and the read rejects with the TimeoutError reason.
+  let error: unknown
+  try {
+    await readAll(stream)
+  } catch (err) {
+    error = err
+  }
+  assert.equal((error as DOMException)?.name, 'TimeoutError')
+  assert.equal(cleanups, 1)
+  assert.equal(controller.signal.aborted, true)
+})
+
+test('wrapStreamWithConnectionCleanup with idle timeout 0 never auto-aborts', async () => {
+  const { body } = trackedSource()
+  let cleanups = 0
+  const stream = wrapStreamWithConnectionCleanup(body, {
+    clearStartTimeout: () => {},
+    cleanup: () => {
+      cleanups++
+    },
+    controller: new AbortController(),
+    idleTimeoutMs: 0,
+  })
+  assert.equal(await readAll(stream), 'ab')
+  assert.equal(cleanups, 1)
+})
+
+test('wrapStreamWithConnectionCleanup does not abort a slow consumer (wire-only)', async () => {
+  // Source has both chunks ready immediately; the consumer pauses far longer
+  // than the idle timeout between reads. Because the timer is armed only around
+  // the network read and cleared as soon as a chunk arrives, the consumer's
+  // pace must not trip it.
+  const controller = new AbortController()
+  const { body } = trackedSource()
+  const stream = wrapStreamWithConnectionCleanup(body, {
+    clearStartTimeout: () => {},
+    cleanup: () => {},
+    controller,
+    idleTimeoutMs: 20,
+  })
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+
+  const first = await reader.read()
+  assert.equal(decoder.decode(first.value), 'a')
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  const second = await reader.read()
+  assert.equal(decoder.decode(second.value), 'b')
+  assert.equal(controller.signal.aborted, false)
 })

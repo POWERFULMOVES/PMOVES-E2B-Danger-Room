@@ -1,8 +1,11 @@
 import { InvalidArgumentError } from '../../errors'
+import { shellQuote } from '../../utils'
 import { CommandExitError } from '../commands/commandHandle'
 
 /**
  * Parsed git status entry for a file.
+ *
+ * @deprecated Run git with `sandbox.commands.run()` instead. The git module will be removed in the next major version.
  */
 export interface GitFileStatus {
   /**
@@ -33,6 +36,8 @@ export interface GitFileStatus {
 
 /**
  * Supported normalized git status labels.
+ *
+ * @deprecated Run git with `sandbox.commands.run()` instead. The git module will be removed in the next major version.
  */
 export type GitStatusLabel =
   | 'conflict'
@@ -47,11 +52,15 @@ export type GitStatusLabel =
 
 /**
  * Scope for git config operations.
+ *
+ * @deprecated Run git with `sandbox.commands.run()` instead. The git module will be removed in the next major version.
  */
 export type GitConfigScope = 'global' | 'local' | 'system'
 
 /**
  * Parsed git repository status.
+ *
+ * @deprecated Run git with `sandbox.commands.run()` instead. The git module will be removed in the next major version.
  */
 export interface GitStatus {
   /**
@@ -122,6 +131,8 @@ export interface GitStatus {
 
 /**
  * Parsed git branch list.
+ *
+ * @deprecated Run git with `sandbox.commands.run()` instead. The git module will be removed in the next major version.
  */
 export interface GitBranches {
   /**
@@ -132,15 +143,6 @@ export interface GitBranches {
    * Current branch name, if available.
    */
   currentBranch?: string
-}
-
-/**
- * Escape a string for safe use in a shell command.
- *
- * This uses single-quoted shell escaping and safely handles embedded single quotes.
- */
-export function shellEscape(value: string): string {
-  return `'${value.replace(/'/g, "'\"'\"'")}'`
 }
 
 /**
@@ -249,7 +251,7 @@ export function buildGitCommand(args: string[], repoPath?: string): string {
   }
   parts.push(...args)
 
-  return parts.map((part) => shellEscape(part)).join(' ')
+  return parts.map((part) => shellQuote(part)).join(' ')
 }
 
 type GitPushArgsOptions = {

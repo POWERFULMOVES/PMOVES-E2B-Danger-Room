@@ -1,32 +1,24 @@
 import * as commander from 'commander'
 import * as chalk from 'chalk'
-import * as fs from 'fs'
 
 import {
   asBold,
   asFormattedError,
   asFormattedSandboxTemplate,
-  asLocal,
-  asLocalRelative,
+  SandboxTemplateRef,
 } from 'src/utils/format'
 import {
-  configOption,
-  pathOption,
   selectMultipleOption,
-  teamOption,
+  deprecatedConfigOption,
+  deprecatedTeamOption,
+  projectIdFromOptions,
+  projectOption,
+  warnIgnoredConfigOption,
 } from 'src/options'
-import {
-  E2BConfig,
-  configName,
-  deleteConfig,
-  getConfigPath,
-  loadConfig,
-} from 'src/config'
-import { getRoot } from 'src/utils/filesystem'
 import { listSandboxTemplates } from './list'
 import { getPromptTemplates } from 'src/utils/templatePrompt'
 import { confirm } from 'src/utils/confirm'
-import { client, resolveTeamId } from 'src/api'
+import { client, resolveProjectId } from 'src/api'
 import { handleE2BRequestError } from '../../utils/errors'
 
 async function deleteTemplate(templateID: string) {
@@ -43,50 +35,46 @@ async function deleteTemplate(templateID: string) {
 }
 
 export const deleteCommand = new commander.Command('delete')
-  .description(`delete sandbox template and ${asLocal(configName)} config`)
+  .description('delete sandbox template')
   .argument(
     '[template]',
-    `specify ${asBold('[template]')} to delete it. If you dont specify ${asBold(
+    `specify ${asBold(
       '[template]'
-    )} the command will try to delete sandbox template defined by ${asLocal(
-      'e2b.toml'
-    )}.`
+    )} to delete it, or select templates interactively with ${asBold('-s')}`
   )
-  .addOption(pathOption)
-  .addOption(configOption)
   .addOption(selectMultipleOption)
-  .addOption(teamOption)
+  .addOption(projectOption)
+  .addOption(deprecatedTeamOption)
+  .addOption(deprecatedConfigOption)
   .alias('dl')
   .option('-y, --yes', 'skip manual delete confirmation')
   .action(
     async (
       template,
       opts: {
-        path?: string
-        config?: string
         yes?: boolean
         select?: boolean
+        project?: string
         team?: string
+        config?: string
       }
     ) => {
       try {
-        let teamId = opts.team
+        warnIgnoredConfigOption(opts)
 
-        const root = getRoot(opts.path)
+        let projectId = projectIdFromOptions(opts)
 
-        const templates: (Pick<E2BConfig, 'template_id'> & {
-          configPath?: string
-        })[] = []
+        const templates: SandboxTemplateRef[] = []
 
         if (template) {
           templates.push({
-            template_id: template,
+            templateID: template,
           })
         } else if (opts.select) {
-          teamId = resolveTeamId(teamId)
+          projectId = resolveProjectId(projectId)
 
           const allTemplates = await listSandboxTemplates({
-            teamID: teamId,
+            projectId,
           })
 
           const selectedTemplates = await getPromptTemplates(
@@ -95,8 +83,8 @@ export const deleteCommand = new commander.Command('delete')
           )
           templates.push(
             ...selectedTemplates.map((e) => ({
-              template_id: e.templateID,
-              ...e,
+              templateID: e.templateID,
+              aliases: e.aliases,
             }))
           )
 
@@ -104,27 +92,6 @@ export const deleteCommand = new commander.Command('delete')
             console.log('No sandbox templates selected')
             return
           }
-        } else {
-          const configPath = getConfigPath(root, opts.config)
-          const config = fs.existsSync(configPath)
-            ? await loadConfig(configPath)
-            : undefined
-
-          if (!config) {
-            console.log(
-              `No ${asLocal(configName)} found in ${asLocalRelative(
-                root
-              )}. Specify sandbox template with ${asBold(
-                '[template]'
-              )} argument or use interactive mode with ${asBold('-s')} flag.`
-            )
-            return
-          }
-
-          templates.push({
-            ...config,
-            configPath,
-          })
         }
 
         if (!templates || templates.length === 0) {
@@ -141,14 +108,7 @@ export const deleteCommand = new commander.Command('delete')
             chalk.default.underline('\nSandbox templates to delete')
           )
         )
-        templates.forEach((e) =>
-          console.log(
-            asFormattedSandboxTemplate(
-              { ...e, templateID: e.template_id },
-              e.configPath
-            )
-          )
-        )
+        templates.forEach((e) => console.log(asFormattedSandboxTemplate(e)))
         process.stdout.write('\n')
 
         if (!opts.yes) {
@@ -167,15 +127,9 @@ export const deleteCommand = new commander.Command('delete')
         await Promise.all(
           templates.map(async (e) => {
             console.log(
-              `- Deleting sandbox template ${asFormattedSandboxTemplate(
-                { ...e, templateID: e.template_id },
-                e.configPath
-              )}`
+              `- Deleting sandbox template ${asFormattedSandboxTemplate(e)}`
             )
-            await deleteTemplate(e.template_id)
-            if (e.configPath) {
-              await deleteConfig(e.configPath)
-            }
+            await deleteTemplate(e.templateID)
           })
         )
         process.stdout.write('\n')

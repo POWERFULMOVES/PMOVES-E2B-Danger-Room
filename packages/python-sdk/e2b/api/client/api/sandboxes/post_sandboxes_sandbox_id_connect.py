@@ -54,10 +54,22 @@ def _parse_response(
         response_404 = Error.from_dict(response.json())
 
         return response_404
+    if response.status_code == 409:
+        response_409 = Error.from_dict(response.json())
+
+        return response_409
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
         return response_500
+    if response.status_code == 503:
+        response_503 = Error.from_dict(response.json())
+
+        return response_503
+    if response.status_code == 504:
+        response_504 = Error.from_dict(response.json())
+
+        return response_504
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -81,7 +93,9 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: ConnectSandbox,
 ) -> Response[Union[Error, Sandbox]]:
-    """Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+    """Connect sandbox
+
+     Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
 
     Args:
         sandbox_id (str):
@@ -113,7 +127,9 @@ def sync(
     client: AuthenticatedClient,
     body: ConnectSandbox,
 ) -> Optional[Union[Error, Sandbox]]:
-    """Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+    """Connect sandbox
+
+     Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
 
     Args:
         sandbox_id (str):
@@ -140,7 +156,9 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: ConnectSandbox,
 ) -> Response[Union[Error, Sandbox]]:
-    """Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+    """Connect sandbox
+
+     Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
 
     Args:
         sandbox_id (str):
@@ -170,7 +188,9 @@ async def asyncio(
     client: AuthenticatedClient,
     body: ConnectSandbox,
 ) -> Optional[Union[Error, Sandbox]]:
-    """Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+    """Connect sandbox
+
+     Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
 
     Args:
         sandbox_id (str):

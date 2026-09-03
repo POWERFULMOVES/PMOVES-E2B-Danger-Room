@@ -3,8 +3,12 @@ import { playwright } from '@vitest/browser-playwright'
 import { config } from 'dotenv'
 
 const env = config()
+const maxWorkers = process.env.E2B_TEST_MAX_WORKERS
+  ? Number(process.env.E2B_TEST_MAX_WORKERS)
+  : undefined
 export default defineConfig({
   test: {
+    maxWorkers,
     projects: [
       {
         test: {
@@ -12,7 +16,6 @@ export default defineConfig({
           include: ['tests/**/*.test.ts'],
           exclude: [
             'tests/runtimes/**',
-            'tests/integration/**',
             'tests/template/**',
             'tests/connectionConfig.test.ts',
           ],
@@ -24,8 +27,10 @@ export default defineConfig({
           isolate: true,
           globals: false,
           testTimeout: 30_000,
+          maxWorkers,
           environment: 'node',
           bail: 0,
+          setupFiles: ['tests/globalFetchFallback.setup.ts'],
           server: {},
           deps: {
             interopDefault: true,
@@ -55,27 +60,13 @@ export default defineConfig({
       },
       {
         test: {
-          include: ['tests/runtimes/edge/**/*.{test,spec}.ts'],
-          name: 'edge',
-          environment: 'edge-runtime',
-        },
-      },
-      {
-        test: {
-          name: 'integration',
-          include: ['tests/integration/**/*.test.ts'],
-          globals: false,
-          testTimeout: 60_000,
-          environment: 'node',
-        },
-      },
-      {
-        test: {
           name: 'template',
           include: ['tests/template/**/*.test.ts'],
           globals: false,
           testTimeout: 180_000,
+          maxWorkers,
           environment: 'node',
+          setupFiles: ['tests/globalFetchFallback.setup.ts'],
         },
       },
       {

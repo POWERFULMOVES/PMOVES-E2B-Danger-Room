@@ -13,13 +13,24 @@ import {
   KEEPALIVE_PING_INTERVAL_SEC,
   setupRequestController,
   Username,
+  wrapStreamWithConnectionCleanup,
 } from '../../connectionConfig'
 
-import { handleEnvdApiError, handleWatchDirStartEvent } from '../../envd/api'
-import { authenticationHeader, handleRpcError } from '../../envd/rpc'
+import {
+  checkSandboxHealth,
+  handleEnvdApiError,
+  handleEnvdApiFetchError,
+  handleWatchDirStartEvent,
+} from '../../envd/api'
+import {
+  authenticationHeader,
+  handleRpcErrorWithHealthCheck,
+  SandboxHealthCheck,
+} from '../../envd/rpc'
 
 import { EnvdApiClient } from '../../envd/api'
 import {
+  EntryInfo as FsEntryInfo,
   Filesystem as FilesystemService,
   FileType as FsFileType,
 } from '../../envd/filesystem/filesystem_pb'
@@ -30,15 +41,19 @@ import type { Timestamp } from '@bufbuild/protobuf/wkt'
 import { compareVersions } from 'compare-versions'
 import {
   ENVD_DEFAULT_USER,
+  ENVD_FILE_METADATA,
   ENVD_OCTET_STREAM_UPLOAD,
+  ENVD_VERSION_FS_EVENT_ENTRY_INFO,
   ENVD_VERSION_RECURSIVE_WATCH,
+  ENVD_VERSION_WATCH_NETWORK_MOUNTS,
 } from '../../envd/versions'
 import {
   FileNotFoundError,
   InvalidArgumentError,
   TemplateError,
 } from '../../errors'
-import { toBlob, toUploadBody } from '../../utils'
+import { isReadableStreamLike } from '../../is'
+import { runtime, toBlob, toUploadBody } from '../../utils'
 
 const FILESYSTEM_HTTP_ERROR_MAP: Record<number, (message: string) => Error> = {
   404: (message: string) => new FileNotFoundError(message),
@@ -50,8 +65,15 @@ const FILESYSTEM_RPC_ERROR_MAP: Partial<
   [Code.NotFound]: (message: string) => new FileNotFoundError(message),
 }
 
-function handleFilesystemRpcError(err: unknown): Error {
-  return handleRpcError(err, FILESYSTEM_RPC_ERROR_MAP)
+async function handleFilesystemRpcError(
+  err: unknown,
+  checkHealth?: SandboxHealthCheck
+): Promise<Error> {
+  return handleRpcErrorWithHealthCheck(
+    err,
+    checkHealth,
+    FILESYSTEM_RPC_ERROR_MAP
+  )
 }
 
 function handleFilesystemEnvdApiError(res: {
@@ -77,6 +99,13 @@ export interface WriteInfo {
    * Path to the filesystem object.
    */
   path: string
+  /**
+   * User-defined metadata stored on the file as `user.e2b.*` extended
+   * attributes. On writes this reflects the metadata supplied on upload; on
+   * reads (`getInfo`, `list`, `rename`) it reflects any `user.e2b.*` xattr on
+   * the file, including ones set out-of-band. `undefined` when none is set.
+   */
+  metadata?: Record<string, string>
 }
 
 export interface EntryInfo extends WriteInfo {
@@ -128,6 +157,10 @@ export enum FileType {
    * Filesystem object is a directory.
    */
   DIR = 'dir',
+  /**
+   * Filesystem object is a symlink.
+   */
+  SYMLINK = 'symlink',
 }
 
 export type WriteEntry = {
@@ -141,6 +174,8 @@ function mapFileType(fileType: FsFileType) {
       return FileType.DIR
     case FsFileType.FILE:
       return FileType.FILE
+    case FsFileType.SYMLINK:
+      return FileType.SYMLINK
   }
 }
 
@@ -151,6 +186,71 @@ function mapModifiedTime(modifiedTime: Timestamp | undefined) {
     Number(modifiedTime.seconds) * 1000 +
       Math.floor(modifiedTime.nanos / 1_000_000)
   )
+}
+
+function mapMetadata(
+  metadata: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  if (!metadata) return undefined
+  return Object.keys(metadata).length === 0 ? undefined : metadata
+}
+
+const METADATA_HEADER_PREFIX = 'X-Metadata-'
+
+// Metadata keys travel as `X-Metadata-<key>` HTTP header names, so they must be
+// valid header tokens (RFC 7230); values travel as header values, restricted to
+// printable US-ASCII.
+const METADATA_KEY_REGEX = /^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$/
+const METADATA_VALUE_REGEX = /^[\x20-\x7e]*$/
+
+function validateMetadata(metadata: Record<string, string> | undefined): void {
+  if (!metadata) return
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!METADATA_KEY_REGEX.test(key)) {
+      throw new InvalidArgumentError(
+        `Invalid metadata key ${JSON.stringify(
+          key
+        )}: keys must be non-empty and use only HTTP token characters (letters, digits and !#$%&'*+-.^_\`|~).`
+      )
+    }
+    if (!METADATA_VALUE_REGEX.test(value)) {
+      throw new InvalidArgumentError(
+        `Invalid metadata value for key ${JSON.stringify(
+          key
+        )}: values must be printable US-ASCII.`
+      )
+    }
+  }
+}
+
+function metadataHeaders(
+  metadata: Record<string, string> | undefined
+): Record<string, string> {
+  if (!metadata) return {}
+  const headers: Record<string, string> = {}
+  for (const [key, value] of Object.entries(metadata)) {
+    headers[`${METADATA_HEADER_PREFIX}${key}`] = value
+  }
+  return headers
+}
+
+/**
+ * Map a protobuf `EntryInfo` to the SDK `EntryInfo`.
+ */
+export function mapEntryInfo(entry: FsEntryInfo): EntryInfo {
+  return {
+    name: entry.name,
+    type: mapFileType(entry.type),
+    path: entry.path,
+    size: Number(entry.size),
+    mode: entry.mode,
+    permissions: entry.permissions,
+    owner: entry.owner,
+    group: entry.group,
+    modifiedTime: mapModifiedTime(entry.modifiedTime),
+    symlinkTarget: entry.symlinkTarget,
+    metadata: mapMetadata(entry.metadata),
+  }
 }
 
 /**
@@ -170,16 +270,34 @@ export interface FilesystemRequestOpts
  */
 export interface FilesystemWriteOpts extends FilesystemRequestOpts {
   /**
-   * When true, the upload will be gzip-compressed.
+   * When true, the upload will be gzip-compressed. Implies the
+   * `application/octet-stream` upload.
+   *
+   * Requires envd 0.5.7 or later — when not supported by the sandbox's envd
+   * version, the upload falls back to uncompressed `multipart/form-data`.
    */
   gzip?: boolean
   /**
    * When true, the upload uses `application/octet-stream` instead of `multipart/form-data`.
+   * Outside the browser, `ReadableStream` data is then streamed to the sandbox
+   * instead of being buffered in memory.
    *
-   * Defaults to `false`. Requires envd 0.5.7 or later — when not supported by
-   * the sandbox's envd version, the upload falls back to `multipart/form-data`.
+   * Defaults to `undefined`, which uses octet-stream when any entry is a
+   * `ReadableStream` (so streamed uploads aren't buffered) and
+   * `multipart/form-data` otherwise; browsers always use `multipart/form-data`
+   * since they can't stream request bodies. Requires envd 0.5.7 or later — when
+   * not supported by the sandbox's envd version, the upload falls back to
+   * `multipart/form-data`.
    */
   useOctetStream?: boolean
+  /**
+   * User-defined metadata to persist on the uploaded file(s) as extended
+   * attributes. Keys are lowercased by the sandbox, so they may differ in case
+   * when read back. Invalid keys or values throw an `InvalidArgumentError`.
+   * The same metadata is applied to every file in a multi-file upload.
+   * Requires envd 0.6.2 or later.
+   */
+  metadata?: Record<string, string>
 }
 
 /**
@@ -190,6 +308,14 @@ export interface FilesystemReadOpts extends FilesystemRequestOpts {
    * When true, the download will request gzip-encoded responses.
    */
   gzip?: boolean
+  /**
+   * Idle timeout for a streamed read (`format: 'stream'`) in **milliseconds**:
+   * abort if no chunk arrives from the server within this window *while
+   * reading*. It bounds only the wire — a slow or paused consumer never trips
+   * it (a consumer that holds the stream but stops reading is reclaimed
+   * server-side). Defaults to the request timeout (60s); pass `0` to disable.
+   */
+  streamIdleTimeoutMs?: number
 }
 
 export interface FilesystemListOpts extends FilesystemRequestOpts {
@@ -218,6 +344,25 @@ export interface WatchOpts extends FilesystemRequestOpts {
    * Watch the directory recursively
    */
   recursive?: boolean
+  /**
+   * Include the {@link EntryInfo} of the affected entry in each {@link FilesystemEvent}.
+   *
+   * The entry is populated best-effort and may be `undefined` for events where the
+   * entry no longer exists at the path (e.g. remove or rename-away events).
+   *
+   * Requires envd 0.6.3 or later. Watching with this option against an older sandbox
+   * throws a `TemplateError`.
+   */
+  includeEntry?: boolean
+  /**
+   * Allow watching paths on network filesystem mounts (NFS, CIFS, SMB, FUSE),
+   * which are rejected by default. Events on network mounts may be unreliable
+   * or not delivered at all.
+   *
+   * Requires envd 0.6.4 or later. Watching with this option against an older sandbox
+   * throws a `TemplateError`.
+   */
+  allowNetworkMounts?: boolean
 }
 
 /**
@@ -228,6 +373,7 @@ export class Filesystem {
 
   private readonly defaultWatchTimeout = 60_000 // 60 seconds
   private readonly defaultWatchRecursive = false
+  private readonly checkHealth: SandboxHealthCheck
 
   constructor(
     transport: Transport,
@@ -235,6 +381,7 @@ export class Filesystem {
     private readonly connectionConfig: ConnectionConfig
   ) {
     this.rpc = createClient(FilesystemService, transport)
+    this.checkHealth = () => checkSandboxHealth(this.envdApi)
   }
 
   /**
@@ -287,6 +434,11 @@ export class Filesystem {
    *
    * You can pass `text`, `bytes`, `blob`, or `stream` to `opts.format` to change the return type.
    *
+   * The request timeout bounds only the initial handshake. The returned stream
+   * holds a pooled connection until it is fully read, cancelled, errors, or the
+   * idle timeout (`opts.streamIdleTimeoutMs`) fires—so consume it to the end or
+   * cancel it (`opts.signal`).
+   *
    * @param path path to the file.
    * @param opts connection options.
    * @param [opts.format] format of the file content—`stream`.
@@ -318,33 +470,100 @@ export class Filesystem {
       headers['Accept-Encoding'] = 'gzip'
     }
 
-    const res = await this.envdApi.api.GET('/files', {
-      params: {
-        query: {
-          path,
-          username: user,
-        },
-      },
-      parseAs: format === 'bytes' ? 'arrayBuffer' : format,
-      signal: this.connectionConfig.getSignal(
-        opts?.requestTimeoutMs,
+    if (format === 'stream') {
+      // The request timeout bounds only the initial handshake; once the
+      // response arrives, the stream lives until it's consumed, cancelled, the
+      // user signal aborts, or the per-chunk idle timeout fires.
+      const requestTimeoutMs =
+        opts?.requestTimeoutMs ?? this.connectionConfig.requestTimeoutMs
+      const { controller, clearStartTimeout, cleanup } = setupRequestController(
+        requestTimeoutMs,
         opts?.signal
-      ),
-      headers,
-    })
+      )
+
+      try {
+        const res = await this.envdApi.api
+          .GET('/files', {
+            params: {
+              query: {
+                path,
+                username: user,
+              },
+            },
+            parseAs: 'stream',
+            signal: controller.signal,
+            headers,
+          })
+          .catch(async (err) => {
+            // Map a dropped connection during the handshake (e.g. killed
+            // sandbox) to a typed error via the health check, matching the
+            // non-stream read path below.
+            throw await handleEnvdApiFetchError(err, this.checkHealth)
+          })
+
+        const err = await handleFilesystemEnvdApiError(res)
+        if (err) {
+          // Cancel the unconsumed error body so the pooled connection is
+          // released before we propagate, matching the Python stream path's
+          // `r.close()`. `cleanup()`'s abort would also release it, but
+          // cancelling is explicit and independent of runtime abort semantics.
+          if (res.response.body && !res.response.bodyUsed) {
+            await res.response.body.cancel().catch(() => {})
+          }
+          cleanup()
+          throw err
+        }
+
+        return wrapStreamWithConnectionCleanup(
+          res.data as ReadableStream<Uint8Array> | null,
+          {
+            clearStartTimeout,
+            cleanup,
+            controller,
+            idleTimeoutMs: opts?.streamIdleTimeoutMs ?? requestTimeoutMs,
+          }
+        )
+      } catch (err) {
+        cleanup()
+        throw err
+      }
+    }
+
+    const res = await this.envdApi.api
+      .GET('/files', {
+        params: {
+          query: {
+            path,
+            username: user,
+          },
+        },
+        parseAs: format === 'bytes' ? 'arrayBuffer' : format,
+        signal: this.connectionConfig.getSignal(
+          opts?.requestTimeoutMs,
+          opts?.signal
+        ),
+        headers,
+      })
+      .catch(async (err) => {
+        throw await handleEnvdApiFetchError(err, this.checkHealth)
+      })
 
     const err = await handleFilesystemEnvdApiError(res)
     if (err) {
       throw err
     }
 
-    if (format === 'bytes') {
-      return new Uint8Array(res.data as ArrayBuffer)
+    // When the file is empty, the response body is skipped and `res.data` is
+    // `undefined`. Return the proper empty value for the requested format.
+    if (res.response.headers.get('content-length') === '0') {
+      if (format === 'bytes') {
+        return new Uint8Array(0)
+      }
+      return format === 'blob' ? new Blob([]) : ''
     }
 
-    // When the file is empty, res.data is parsed as `{}`. This is a workaround to return an empty string.
-    if (res.response.headers.get('content-length') === '0') {
-      return ''
+    if (format === 'bytes') {
+      return new Uint8Array(res.data as ArrayBuffer)
     }
 
     return res.data
@@ -426,18 +645,42 @@ export class Filesystem {
       user = defaultUsername
     }
 
+    const useGzip = writeOpts?.gzip === true
+
     const supportsOctetStream =
       compareVersions(this.envdApi.version, ENVD_OCTET_STREAM_UPLOAD) >= 0
+    // Streaming a request body only happens on the octet-stream path; the
+    // multipart path buffers via `toBlob`. So default to octet-stream when any
+    // entry is a `ReadableStream`, otherwise a streamed upload would be
+    // silently buffered. Browsers can't stream request bodies, so they stay on
+    // multipart. Gzip also implies octet-stream (the Content-Encoding header
+    // applies to the whole request body). An explicit `useOctetStream` wins.
+    const hasStreamableData =
+      runtime !== 'browser' &&
+      writeFiles.some((file) => isReadableStreamLike(file.data))
     const useOctetStream =
-      (writeOpts?.useOctetStream ?? false) && supportsOctetStream
+      ((writeOpts?.useOctetStream ?? hasStreamableData) || useGzip) &&
+      supportsOctetStream
+
+    const metadata = writeOpts?.metadata
+    validateMetadata(metadata)
+    if (
+      metadata &&
+      Object.keys(metadata).length > 0 &&
+      compareVersions(this.envdApi.version, ENVD_FILE_METADATA) < 0
+    ) {
+      throw new TemplateError('File metadata requires envd 0.6.2 or later.')
+    }
+    // Metadata is sent as request-scoped `X-Metadata-*` headers, so the same
+    // metadata is applied to every file in a multi-file upload.
+    const extraHeaders = metadataHeaders(metadata)
 
     const results: WriteInfo[] = []
-
-    const useGzip = writeOpts?.gzip === true
 
     if (useOctetStream) {
       const headers: Record<string, string> = {
         'Content-Type': 'application/octet-stream',
+        ...extraHeaders,
       }
       if (useGzip) {
         headers['Content-Encoding'] = 'gzip'
@@ -446,23 +689,39 @@ export class Filesystem {
       const uploadResults = await Promise.all(
         writeFiles.map(async (file) => {
           const filePath = path ?? (file as WriteEntry).path
-          const body = await toUploadBody(file.data, useGzip)
+          const { body, streamed } = await toUploadBody(file.data, useGzip)
+          // A streamed upload carries no client-side timeout: the socket-write
+          // "wire" isn't observable through fetch, and a stalled producer is
+          // the caller's own code, so a stuck streamed upload is bounded
+          // server-side (or via `writeOpts.signal`). Buffered uploads keep the
+          // normal request timeout.
+          const signal = streamed
+            ? writeOpts?.signal
+            : this.connectionConfig.getSignal(
+                writeOpts?.requestTimeoutMs,
+                writeOpts?.signal
+              )
 
-          const res = await this.envdApi.api.POST('/files', {
-            params: {
-              query: {
-                path: filePath,
-                username: user,
+          const res = await this.envdApi.api
+            .POST('/files', {
+              params: {
+                query: {
+                  path: filePath,
+                  username: user,
+                },
               },
-            },
-            bodySerializer: () => body,
-            headers,
-            signal: this.connectionConfig.getSignal(
-              writeOpts?.requestTimeoutMs,
-              writeOpts?.signal
-            ),
-            body: {},
-          })
+              bodySerializer: () => body,
+              headers,
+              signal,
+              body: {},
+              // Streaming request bodies require half-duplex mode.
+              ...(streamed && {
+                duplex: 'half' as const,
+              }),
+            })
+            .catch(async (err) => {
+              throw await handleEnvdApiFetchError(err, this.checkHealth)
+            })
 
           const err = await handleFilesystemEnvdApiError(res)
           if (err) {
@@ -474,6 +733,10 @@ export class Filesystem {
             throw new Error(
               'Expected to receive information about written file'
             )
+          }
+
+          for (const f of files) {
+            f.metadata = mapMetadata(f.metadata)
           }
 
           return files
@@ -493,20 +756,25 @@ export class Filesystem {
         )
       }
 
-      const res = await this.envdApi.api.POST('/files', {
-        params: {
-          query: {
-            path,
-            username: user,
+      const res = await this.envdApi.api
+        .POST('/files', {
+          params: {
+            query: {
+              path,
+              username: user,
+            },
           },
-        },
-        bodySerializer: () => formData,
-        signal: this.connectionConfig.getSignal(
-          writeOpts?.requestTimeoutMs,
-          writeOpts?.signal
-        ),
-        body: {},
-      })
+          bodySerializer: () => formData,
+          headers: extraHeaders,
+          signal: this.connectionConfig.getSignal(
+            writeOpts?.requestTimeoutMs,
+            writeOpts?.signal
+          ),
+          body: {},
+        })
+        .catch(async (err) => {
+          throw await handleEnvdApiFetchError(err, this.checkHealth)
+        })
 
       const err = await handleFilesystemEnvdApiError(res)
       if (err) {
@@ -516,6 +784,10 @@ export class Filesystem {
       const files = res.data as WriteInfo[]
       if (!files || files.length === 0) {
         throw new Error('Expected to receive information about written file')
+      }
+
+      for (const f of files) {
+        f.metadata = mapMetadata(f.metadata)
       }
 
       results.push(...files)
@@ -577,27 +849,17 @@ export class Filesystem {
       const entries: EntryInfo[] = []
 
       for (const e of res.entries) {
-        const type = mapFileType(e.type)
-
-        if (type) {
-          entries.push({
-            name: e.name,
-            type,
-            path: e.path,
-            size: Number(e.size),
-            mode: e.mode,
-            permissions: e.permissions,
-            owner: e.owner,
-            group: e.group,
-            modifiedTime: mapModifiedTime(e.modifiedTime),
-            symlinkTarget: e.symlinkTarget,
-          })
+        // Skip entries with an unknown file type.
+        if (!mapFileType(e.type)) {
+          continue
         }
+
+        entries.push(mapEntryInfo(e))
       }
 
       return entries
     } catch (err) {
-      throw handleFilesystemRpcError(err)
+      throw await handleFilesystemRpcError(err, this.checkHealth)
     }
   }
 
@@ -630,7 +892,7 @@ export class Filesystem {
         }
       }
 
-      throw handleFilesystemRpcError(err)
+      throw await handleFilesystemRpcError(err, this.checkHealth)
     }
   }
 
@@ -668,20 +930,9 @@ export class Filesystem {
         throw new Error('Expected to receive information about moved object')
       }
 
-      return {
-        name: entry.name,
-        type: mapFileType(entry.type),
-        path: entry.path,
-        size: Number(entry.size),
-        mode: entry.mode,
-        permissions: entry.permissions,
-        owner: entry.owner,
-        group: entry.group,
-        modifiedTime: mapModifiedTime(entry.modifiedTime),
-        symlinkTarget: entry.symlinkTarget,
-      }
+      return mapEntryInfo(entry)
     } catch (err) {
-      throw handleFilesystemRpcError(err)
+      throw await handleFilesystemRpcError(err, this.checkHealth)
     }
   }
 
@@ -704,7 +955,7 @@ export class Filesystem {
         }
       )
     } catch (err) {
-      throw handleFilesystemRpcError(err)
+      throw await handleFilesystemRpcError(err, this.checkHealth)
     }
   }
 
@@ -737,7 +988,7 @@ export class Filesystem {
         }
       }
 
-      throw handleFilesystemRpcError(err)
+      throw await handleFilesystemRpcError(err, this.checkHealth)
     }
   }
 
@@ -771,20 +1022,9 @@ export class Filesystem {
         )
       }
 
-      return {
-        name: res.entry.name,
-        type: mapFileType(res.entry.type),
-        path: res.entry.path,
-        size: Number(res.entry.size),
-        mode: res.entry.mode,
-        permissions: res.entry.permissions,
-        owner: res.entry.owner,
-        group: res.entry.group,
-        modifiedTime: mapModifiedTime(res.entry.modifiedTime),
-        symlinkTarget: res.entry.symlinkTarget,
-      }
+      return mapEntryInfo(res.entry)
     } catch (err) {
-      throw handleFilesystemRpcError(err)
+      throw await handleFilesystemRpcError(err, this.checkHealth)
     }
   }
 
@@ -810,8 +1050,29 @@ export class Filesystem {
       compareVersions(this.envdApi.version, ENVD_VERSION_RECURSIVE_WATCH) < 0
     ) {
       throw new TemplateError(
-        'You need to update the template to use recursive watching. ' +
-          'You can do this by running `e2b template build` in the directory with the template.'
+        'You need to update the template to use recursive watching.'
+      )
+    }
+
+    if (
+      opts?.includeEntry &&
+      this.envdApi.version &&
+      compareVersions(this.envdApi.version, ENVD_VERSION_FS_EVENT_ENTRY_INFO) <
+        0
+    ) {
+      throw new TemplateError(
+        'You need to update the template to include entry info in watch events.'
+      )
+    }
+
+    if (
+      opts?.allowNetworkMounts &&
+      this.envdApi.version &&
+      compareVersions(this.envdApi.version, ENVD_VERSION_WATCH_NETWORK_MOUNTS) <
+        0
+    ) {
+      throw new TemplateError(
+        'You need to update the template to watch directories on network mounts.'
       )
     }
 
@@ -827,6 +1088,8 @@ export class Filesystem {
       {
         path,
         recursive: opts?.recursive ?? this.defaultWatchRecursive,
+        includeEntry: opts?.includeEntry ?? false,
+        allowNetworkMounts: opts?.allowNetworkMounts ?? false,
       },
       {
         headers: {
@@ -842,10 +1105,16 @@ export class Filesystem {
       await handleWatchDirStartEvent(events)
       clearStartTimeout()
 
-      return new WatchHandle(cleanup, events, onEvent, opts?.onExit)
+      return new WatchHandle(
+        cleanup,
+        events,
+        onEvent,
+        opts?.onExit,
+        this.checkHealth
+      )
     } catch (err) {
       cleanup()
-      throw handleFilesystemRpcError(err)
+      throw await handleFilesystemRpcError(err, this.checkHealth)
     }
   }
 }

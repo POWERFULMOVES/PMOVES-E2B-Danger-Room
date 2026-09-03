@@ -94,3 +94,139 @@ def test_sandbox_direct_url_uses_explicit_url_first():
         config.get_sandbox_direct_url("sandbox-id", "e2b.app")
         == "https://sandbox.example.com"
     )
+
+
+def test_debug_false_overrides_env_var(monkeypatch):
+    monkeypatch.setenv("E2B_DEBUG", "true")
+
+    config = ConnectionConfig(debug=False)
+    assert config.debug is False
+
+
+def test_debug_defaults_to_env_var(monkeypatch):
+    monkeypatch.setenv("E2B_DEBUG", "true")
+
+    config = ConnectionConfig()
+    assert config.debug is True
+
+
+def test_set_integration_appends_to_user_agent():
+    ConnectionConfig.set_integration("testing/version")
+    try:
+        config = ConnectionConfig()
+
+        assert config.headers["User-Agent"].startswith("e2b-python-sdk/")
+        assert "testing/version" in config.headers["User-Agent"].split()
+    finally:
+        ConnectionConfig.set_integration(None)
+
+    config = ConnectionConfig()
+    assert "testing" not in config.headers["User-Agent"]
+
+
+def test_user_agent_includes_configured_traffic_source(monkeypatch):
+    monkeypatch.setenv("E2B_USER_AGENT_SOURCE", "ci")
+
+    config = ConnectionConfig()
+
+    assert config.headers["User-Agent"].endswith(" source/ci")
+
+
+def test_user_agent_ignores_unsafe_traffic_source(monkeypatch):
+    monkeypatch.setenv("E2B_USER_AGENT_SOURCE", "ci bad\nheader")
+
+    config = ConnectionConfig()
+
+    assert "source/" not in config.headers["User-Agent"]
+
+
+def test_custom_user_agent_is_preserved_without_integration():
+    config = ConnectionConfig(api_headers={"User-Agent": "custom/1.0"})
+
+    assert config.headers["User-Agent"] == "custom/1.0"
+
+
+def test_custom_user_agent_wins_over_integration(monkeypatch):
+    monkeypatch.setattr(ConnectionConfig, "_integration", "testing/version")
+
+    config = ConnectionConfig(api_headers={"User-Agent": "custom/1.0"})
+
+    assert config.headers["User-Agent"] == "custom/1.0"
+
+
+def test_integration_survives_api_param_rebuilds(monkeypatch):
+    monkeypatch.setattr(ConnectionConfig, "_integration", "testing/version")
+
+    config = ConnectionConfig()
+    rebuilt_config = ConnectionConfig(**config.get_api_params())
+
+    assert "testing/version" in rebuilt_config.headers["User-Agent"].split()
+    rebuilt_user_agent = rebuilt_config.get_api_params(api_headers={"X-Test": "1"})[
+        "headers"
+    ]["User-Agent"]
+    assert "testing/version" in rebuilt_user_agent.split()
+
+
+def test_cleared_integration_does_not_leak_into_api_param_rebuilds():
+    ConnectionConfig.set_integration("testing/version")
+    try:
+        config = ConnectionConfig()
+    finally:
+        ConnectionConfig.set_integration(None)
+
+    params = config.get_api_params()
+    assert not params["headers"]["User-Agent"].endswith(" testing/version")
+
+    rebuilt_config = ConnectionConfig(**params)
+    assert not rebuilt_config.headers["User-Agent"].endswith(" testing/version")
+
+
+def test_custom_user_agent_survives_api_param_rebuilds(monkeypatch):
+    monkeypatch.setattr(ConnectionConfig, "_integration", "testing/version")
+
+    config = ConnectionConfig(api_headers={"User-Agent": "custom/1.0"})
+    rebuilt_config = ConnectionConfig(**config.get_api_params())
+
+    assert rebuilt_config.headers["User-Agent"] == "custom/1.0"
+
+    monkeypatch.setattr(ConnectionConfig, "_integration", None)
+
+    config = ConnectionConfig(api_headers={"User-Agent": "custom/1.0"})
+    rebuilt_config = ConnectionConfig(**config.get_api_params())
+    assert rebuilt_config.headers["User-Agent"] == "custom/1.0"
+
+
+def test_per_call_user_agent_override_wins_in_api_params(monkeypatch):
+    monkeypatch.setattr(ConnectionConfig, "_integration", "testing/version")
+
+    config = ConnectionConfig()
+    params = config.get_api_params(api_headers={"User-Agent": "custom/1.0"})
+    assert params["headers"]["User-Agent"] == "custom/1.0"
+
+
+def test_per_call_api_headers_user_agent_wins_over_headers():
+    config = ConnectionConfig()
+    params = config.get_api_params(
+        headers={"User-Agent": "from-headers/1.0"},
+        api_headers={"User-Agent": "from-api-headers/1.0"},
+    )
+    assert params["headers"]["User-Agent"] == "from-api-headers/1.0"
+
+
+def test_request_timeout_zero_means_no_timeout():
+    config = ConnectionConfig(request_timeout=0)
+    assert config.request_timeout is None
+    assert config.get_request_timeout() is None
+    # A per-call value of 0 also disables the timeout.
+    assert config.get_request_timeout(0) is None
+
+
+def test_get_api_params_includes_sandbox_url():
+    config = ConnectionConfig(sandbox_url="https://sandbox.example.com")
+
+    params = config.get_api_params()
+    assert params["sandbox_url"] == "https://sandbox.example.com"
+
+    # Per-call override takes priority.
+    overridden = config.get_api_params(sandbox_url="https://sandbox.override.com")
+    assert overridden["sandbox_url"] == "https://sandbox.override.com"

@@ -13,25 +13,18 @@ export const FINALIZE_STEP_NAME = 'finalize'
 export const BASE_STEP_NAME = 'base'
 
 /**
- * Stack trace depth for capturing caller information.
- *
- * Depth levels:
- * 1. Template function
- * 2. TemplateBase class
- * 3. Caller method (e.g., copy(), fromImage(), etc.)
- *
- * This depth is used to determine the original caller's location
- * for stack traces.
- * @internal
- */
-export const STACK_TRACE_DEPTH = 3
-
-/**
  * Default setting for whether to resolve symbolic links when copying files.
  * When false, symlinks are copied as symlinks rather than following them.
  * @internal
  */
 export const RESOLVE_SYMLINKS = false
+
+/**
+ * Default setting for whether to gzip files when copying them into the
+ * template. When true, the upload archive is gzipped before being uploaded.
+ * @internal
+ */
+export const GZIP = true
 
 /**
  * Default per-request timeout (in milliseconds) for the file-upload phase

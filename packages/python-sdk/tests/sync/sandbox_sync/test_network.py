@@ -1,9 +1,49 @@
 import json
+import time
+from unittest.mock import Mock
+
+import httpx
 
 import pytest
 
 from e2b import SandboxNetworkOpts
 from e2b.sandbox.commands.command_handle import CommandExitException
+
+
+def wait_for_status(
+    client: httpx.Client,
+    url: str,
+    status_code: int,
+    headers: dict[str, str] | None = None,
+    timeout: float = 15,
+) -> httpx.Response:
+    deadline = time.monotonic() + timeout
+    response: httpx.Response | None = None
+    last_transport_error: httpx.TransportError | None = None
+
+    while time.monotonic() < deadline:
+        try:
+            response = client.get(url, headers=headers, follow_redirects=True)
+        except httpx.TransportError as error:
+            last_transport_error = error
+        else:
+            if response.status_code == status_code:
+                return response
+        time.sleep(1)
+
+    if response is not None:
+        return response
+    assert last_transport_error is not None
+    raise last_transport_error
+
+
+def test_wait_for_status_retries_transport_errors():
+    response = httpx.Response(200)
+    client = Mock()
+    client.get.side_effect = [httpx.ConnectError("not ready"), response]
+
+    assert wait_for_status(client, "https://sandbox.test", 200) is response
+    assert client.get.call_count == 2
 
 
 @pytest.mark.skip_debug()
@@ -102,10 +142,6 @@ def test_allow_public_traffic_false(sandbox_factory):
         secure=True, network=SandboxNetworkOpts(allow_public_traffic=False)
     )
 
-    import time
-
-    import httpx
-
     # Verify the sandbox was created successfully and has a traffic access token
     assert sandbox.traffic_access_token is not None
 
@@ -129,7 +165,7 @@ def test_allow_public_traffic_false(sandbox_factory):
 
         # Test 2: Request with valid traffic access token should succeed
         headers = {"e2b-traffic-access-token": sandbox.traffic_access_token}
-        response = client.get(sandbox_url, headers=headers, follow_redirects=True)
+        response = wait_for_status(client, sandbox_url, 200, headers=headers)
         assert response.status_code == 200
 
 
@@ -137,10 +173,6 @@ def test_allow_public_traffic_false(sandbox_factory):
 def test_allow_public_traffic_true(sandbox_factory):
     """Test that sandbox with allow_public_traffic=True works without token."""
     sandbox = sandbox_factory(network=SandboxNetworkOpts(allow_public_traffic=True))
-
-    import time
-
-    import httpx
 
     # Start a simple HTTP server in the sandbox
     port = 8080
@@ -157,19 +189,33 @@ def test_allow_public_traffic_true(sandbox_factory):
 
     with httpx.Client() as client:
         # Request without traffic access token should succeed (public access enabled)
-        response = client.get(sandbox_url, follow_redirects=True)
+        response = wait_for_status(client, sandbox_url, 200)
         assert response.status_code == 200
 
 
 @pytest.mark.skip_debug()
-def test_firewall_transform_injects_headers(sandbox_factory):
+def test_firewall_transform_injects_headers(sandbox_factory, httpbin_template):
     """Test that a firewall rule with a transform injects headers into outbound requests."""
-    injected_header = "X-E2B-Test-Token"
+    injected_header = "X-Test-Token"
     injected_value = "e2b-transform-value-123"
+    # Port the httpbin template's start command listens on.
+    httpbin_port = 8080
+
+    # The transform is applied by the egress proxy on the way out of the
+    # sandbox, so the target has to be reachable from the public internet — a
+    # CI service container would not be. A sidecar sandbox running the httpbin
+    # template is that target, which keeps the test off any externally hosted
+    # service. Its ready command has already passed by the time create returns,
+    # so the server is serving.
+    httpbin = sandbox_factory(
+        template_name=httpbin_template,
+        network=SandboxNetworkOpts(allow_public_traffic=True),
+    )
+    httpbin_host = httpbin.get_host(httpbin_port)
 
     network: SandboxNetworkOpts = {
         "rules": {
-            "httpbin.e2b.team": [
+            httpbin_host: [
                 {"transform": {"headers": {injected_header: injected_value}}},
             ],
         },
@@ -177,13 +223,14 @@ def test_firewall_transform_injects_headers(sandbox_factory):
     sandbox = sandbox_factory(network=network)
 
     result = sandbox.commands.run(
-        "curl -sS --max-time 10 https://httpbin.e2b.team/headers"
+        f"curl -sS --retry 5 --retry-connrefused --max-time 10 "
+        f"https://{httpbin_host}/headers"
     )
     assert result.exit_code == 0
 
     parsed = json.loads(result.stdout)
     reflected = parsed["headers"].get(injected_header)
-    assert reflected == injected_value, (
+    assert reflected == [injected_value], (
         f"expected httpbin to reflect {injected_header}={injected_value}, "
         f"got headers: {parsed['headers']}"
     )
@@ -250,10 +297,6 @@ def test_mask_request_host(sandbox_factory):
         timeout=60,
     )
 
-    import time
-
-    import httpx
-
     port = 8080
     output_file = "/tmp/headers.txt"
 
@@ -269,7 +312,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
     def log_message(self, *a): pass
-http.server.HTTPServer(('', {port}), H).handle_request()
+http.server.HTTPServer(('', {port}), H).serve_forever()
 " """,
         background=True,
     )
@@ -282,12 +325,8 @@ http.server.HTTPServer(('', {port}), H).handle_request()
     # Make a request from OUTSIDE the sandbox through the proxy
     # The Host header should be modified according to mask_request_host
     with httpx.Client() as client:
-        try:
-            client.get(sandbox_url, timeout=5.0)
-        except Exception:
-            pass
-
-    time.sleep(1)
+        response = wait_for_status(client, sandbox_url, 200)
+        assert response.status_code == 200
 
     # Read the captured headers from inside the sandbox
     result = sandbox.commands.run(f"cat {output_file}")

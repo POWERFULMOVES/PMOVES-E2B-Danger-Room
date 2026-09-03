@@ -1,8 +1,13 @@
 import type { PathLike } from 'node:fs'
 import { ApiClient } from '../api'
-import { ConnectionConfig, ConnectionOpts } from '../connectionConfig'
-import { BuildError } from '../errors'
-import { runtime } from '../utils'
+import {
+  ClientFactory,
+  ConnectionConfig,
+  ConnectionOpts,
+} from '../connectionConfig'
+import { BuildError, InvalidArgumentError } from '../errors'
+import { runtime, shellQuote } from '../utils'
+import { callableTemplate } from './callable'
 import {
   assignTags,
   checkAliasExists,
@@ -16,7 +21,7 @@ import {
   uploadFile,
   waitForBuildFinish,
 } from './buildApi'
-import { RESOLVE_SYMLINKS, STACK_TRACE_DEPTH } from './consts'
+import { GZIP, RESOLVE_SYMLINKS } from './consts'
 import { parseDockerfile } from './dockerfileParser'
 import { LogEntry, LogEntryEnd, LogEntryStart } from './logger'
 import { ReadyCmd, waitForFile } from './readycmd'
@@ -50,9 +55,12 @@ import {
 } from './utils'
 
 /**
- * Base class for building E2B sandbox templates.
+ * Builder for E2B sandbox templates, and the entrypoint for the template API.
+ *
+ * Exposed as {@link Template}, which can be called as a factory.
  */
 export class TemplateBase
+  extends ClientFactory
   implements TemplateFromImage, TemplateBuilder, TemplateFinal
 {
   private defaultBaseImage: string = 'e2bdev/base'
@@ -66,16 +74,16 @@ export class TemplateBase
   // Force the next layer to be rebuilt
   private forceNextLayer: boolean = false
   private instructions: Instruction[] = []
-  private fileContextPath: PathLike =
-    runtime === 'browser' ? '.' : (getCallerDirectory(STACK_TRACE_DEPTH) ?? '.')
+  private fileContextPath: PathLike
   private fileIgnorePatterns: string[] = []
   private logsRefreshFrequency: number = 200
   private stackTraces: (string | undefined)[] = []
-  private stackTracesEnabled: boolean = true
-  private stackTracesOverride: string | undefined = undefined
 
   constructor(options?: TemplateOptions) {
-    this.fileContextPath = options?.fileContextPath ?? this.fileContextPath
+    super()
+    this.fileContextPath =
+      options?.fileContextPath ??
+      (runtime === 'browser' ? '.' : (getCallerDirectory() ?? '.'))
     this.fileIgnorePatterns =
       options?.fileIgnorePatterns ?? this.fileIgnorePatterns
   }
@@ -159,32 +167,34 @@ export class TemplateBase
       options
     )
 
+    const buildOpts = this.resolveOpts(buildOptions) ?? {}
+
     try {
-      buildOptions.onBuildLogs?.(new LogEntryStart(new Date(), 'Build started'))
+      buildOpts.onBuildLogs?.(new LogEntryStart(new Date(), 'Build started'))
       const baseTemplate = template as TemplateBase
 
-      const config = new ConnectionConfig(buildOptions)
+      const config = new ConnectionConfig(buildOpts)
       const client = new ApiClient(config)
 
-      const data = await baseTemplate.build(client, config, name, buildOptions)
+      const data = await baseTemplate.build(client, config, name, buildOpts)
 
-      buildOptions.onBuildLogs?.(
+      buildOpts.onBuildLogs?.(
         new LogEntry(new Date(), 'info', 'Waiting for logs...')
       )
 
       await waitForBuildFinish(client, {
         templateID: data.templateId,
         buildID: data.buildId,
-        onBuildLogs: buildOptions.onBuildLogs,
+        onBuildLogs: buildOpts.onBuildLogs,
         logsRefreshFrequency: baseTemplate.logsRefreshFrequency,
         stackTraces: baseTemplate.stackTraces,
-        signal: buildOptions.signal,
+        signal: buildOpts.signal,
         requestTimeoutMs: config.requestTimeoutMs,
       })
 
       return data
     } finally {
-      buildOptions.onBuildLogs?.(new LogEntryEnd(new Date(), 'Build finished'))
+      buildOpts.onBuildLogs?.(new LogEntryEnd(new Date(), 'Build finished'))
     }
   }
 
@@ -241,10 +251,11 @@ export class TemplateBase
       options
     )
 
-    const config = new ConnectionConfig(buildOptions)
+    const buildOpts = this.resolveOpts(buildOptions) ?? {}
+    const config = new ConnectionConfig(buildOpts)
     const client = new ApiClient(config)
 
-    return (template as TemplateBase).build(client, config, name, buildOptions)
+    return (template as TemplateBase).build(client, config, name, buildOpts)
   }
 
   /**
@@ -262,7 +273,7 @@ export class TemplateBase
     data: Pick<BuildInfo, 'templateId' | 'buildId'>,
     options?: GetBuildStatusOptions
   ): Promise<TemplateBuildStatusResponse> {
-    const config = new ConnectionConfig(options)
+    const config = new ConnectionConfig(this.resolveOpts(options))
     const client = new ApiClient(config)
 
     return await getBuildStatus(
@@ -270,7 +281,7 @@ export class TemplateBase
       {
         templateID: data.templateId,
         buildID: data.buildId,
-        logsOffset: options?.logsOffset,
+        logsOffset: options?.logsOffset ?? 0,
       },
       config.getSignal(undefined, options?.signal)
     )
@@ -295,7 +306,7 @@ export class TemplateBase
     name: string,
     options?: ConnectionOpts
   ): Promise<boolean> {
-    return TemplateBase.aliasExists(name, options)
+    return this.aliasExists(name, options)
   }
 
   /**
@@ -318,7 +329,7 @@ export class TemplateBase
     alias: string,
     options?: ConnectionOpts
   ): Promise<boolean> {
-    const config = new ConnectionConfig(options)
+    const config = new ConnectionConfig(this.resolveOpts(options))
     const client = new ApiClient(config)
 
     return checkAliasExists(
@@ -350,7 +361,7 @@ export class TemplateBase
     tags: string | string[],
     options?: ConnectionOpts
   ): Promise<TemplateTagInfo> {
-    const config = new ConnectionConfig(options)
+    const config = new ConnectionConfig(this.resolveOpts(options))
     const client = new ApiClient(config)
     const normalizedTags = Array.isArray(tags) ? tags : [tags]
     return assignTags(
@@ -381,7 +392,7 @@ export class TemplateBase
     tags: string | string[],
     options?: ConnectionOpts
   ): Promise<void> {
-    const config = new ConnectionConfig(options)
+    const config = new ConnectionConfig(this.resolveOpts(options))
     const client = new ApiClient(config)
     const normalizedTags = Array.isArray(tags) ? tags : [tags]
     return removeTags(
@@ -410,7 +421,7 @@ export class TemplateBase
     templateId: string,
     options?: ConnectionOpts
   ): Promise<TemplateTag[]> {
-    const config = new ConnectionConfig(options)
+    const config = new ConnectionConfig(this.resolveOpts(options))
     const client = new ApiClient(config)
     return getTemplateTags(
       client,
@@ -425,6 +436,20 @@ export class TemplateBase
 
   fromUbuntuImage(variant: string = 'latest'): TemplateBuilder {
     return this.fromImage(`ubuntu:${variant}`)
+  }
+
+  fromFedoraImage(variant: string = '44'): TemplateBuilder {
+    return this.fromImage(`fedora:${variant}`)
+  }
+
+  fromAlpineImage(variant: string = '3.24'): TemplateBuilder {
+    return this.fromImage(`alpine:${variant}`)
+  }
+
+  // Left on `latest`: Arch is a rolling release and template provisioning runs
+  // `pacman -Syu`, so pinning a tag would not change the built result.
+  fromArchImage(variant: string = 'latest'): TemplateBuilder {
+    return this.fromImage(`archlinux:${variant}`)
   }
 
   fromPythonImage(version: string = '3'): TemplateBuilder {
@@ -447,6 +472,14 @@ export class TemplateBase
     baseImage: string,
     credentials?: { username: string; password: string }
   ): TemplateBuilder {
+    // Validate before mutating the builder.
+    if (credentials && (!credentials.username || !credentials.password)) {
+      throw new InvalidArgumentError(
+        'Both username and password are required when providing registry credentials',
+        getCallerFrame()
+      )
+    }
+
     this.baseImage = baseImage
     this.baseTemplate = undefined
 
@@ -482,11 +515,9 @@ export class TemplateBase
   }
 
   fromDockerfile(dockerfileContentOrPath: string): TemplateBuilder {
-    const { baseImage } = this.runInStackTraceOverrideContext(
-      () => parseDockerfile(dockerfileContentOrPath, this),
-      // -1 as we're going up the call stack from the parseDockerfile function
-      getCallerFrame(STACK_TRACE_DEPTH - 1)
-    )
+    // Each instruction parsed from the Dockerfile collects its own stack
+    // trace, which resolves to this method's call site
+    const { baseImage } = parseDockerfile(dockerfileContentOrPath, this)
     this.baseImage = baseImage
     this.baseTemplate = undefined
 
@@ -562,6 +593,7 @@ export class TemplateBase
       user?: string
       mode?: number
       resolveSymlinks?: boolean
+      gzip?: boolean
     }
   ): TemplateBuilder {
     if (runtime === 'browser') {
@@ -569,7 +601,7 @@ export class TemplateBase
     }
 
     const srcs = Array.isArray(src) ? src : [src]
-    const stackTrace = getCallerFrame(STACK_TRACE_DEPTH - 1)
+    const stackTrace = getCallerFrame()
 
     for (const src of srcs) {
       const srcString = src.toString()
@@ -590,10 +622,14 @@ export class TemplateBase
         force: options?.forceUpload || this.forceNextLayer,
         forceUpload: options?.forceUpload,
         resolveSymlinks: options?.resolveSymlinks,
+        gzip: options?.gzip,
       })
+
+      // Collect one stack trace per pushed instruction so build steps stay
+      // aligned with their stack traces when copying multiple sources
+      this.collectStackTrace()
     }
 
-    this.collectStackTrace()
     return this
   }
 
@@ -603,24 +639,23 @@ export class TemplateBase
     }
 
     // Stack trace that will be used to re-throw the error with
-    const stackTrace = getCallerFrame(STACK_TRACE_DEPTH - 1)
+    const stackTrace = getCallerFrame()
 
-    this.runInNewStackTraceContext(() => {
-      for (const item of items) {
-        try {
-          this.copy(item.src, item.dest, {
-            forceUpload: item.forceUpload,
-            user: item.user,
-            mode: item.mode,
-            resolveSymlinks: item.resolveSymlinks,
-          })
-        } catch (error) {
-          const copyError = error as Error
-          copyError.stack = stackTrace
-          throw copyError
-        }
+    for (const item of items) {
+      try {
+        this.copy(item.src, item.dest, {
+          forceUpload: item.forceUpload,
+          user: item.user,
+          mode: item.mode,
+          resolveSymlinks: item.resolveSymlinks,
+          gzip: item.gzip,
+        })
+      } catch (error) {
+        const copyError = error as Error
+        copyError.stack = stackTrace
+        throw copyError
       }
-    })
+    }
 
     return this
   }
@@ -637,10 +672,8 @@ export class TemplateBase
     if (options?.force) {
       args.push('-f')
     }
-    args.push(...paths.map((p) => p.toString()))
-    return this.runInNewStackTraceContext(() =>
-      this.runCmd(args.join(' '), { user: options?.user })
-    )
+    args.push(...paths.map((p) => shellQuote(p.toString())))
+    return this.runCmd(args.join(' '), { user: options?.user })
   }
 
   rename(
@@ -648,13 +681,11 @@ export class TemplateBase
     dest: PathLike,
     options?: { force?: boolean; user?: string }
   ): TemplateBuilder {
-    const args = ['mv', src.toString(), dest.toString()]
+    const args = ['mv', shellQuote(src.toString()), shellQuote(dest.toString())]
     if (options?.force) {
       args.push('-f')
     }
-    return this.runInNewStackTraceContext(() =>
-      this.runCmd(args.join(' '), { user: options?.user })
-    )
+    return this.runCmd(args.join(' '), { user: options?.user })
   }
 
   makeDir(
@@ -666,10 +697,8 @@ export class TemplateBase
     if (options?.mode) {
       args.push(`-m ${padOctal(options.mode)}`)
     }
-    args.push(...paths.map((p) => p.toString()))
-    return this.runInNewStackTraceContext(() =>
-      this.runCmd(args.join(' '), { user: options?.user })
-    )
+    args.push(...paths.map((p) => shellQuote(p.toString())))
+    return this.runCmd(args.join(' '), { user: options?.user })
   }
 
   makeSymlink(
@@ -681,10 +710,8 @@ export class TemplateBase
     if (options?.force) {
       args.push('-f')
     }
-    args.push(src.toString(), dest.toString())
-    return this.runInNewStackTraceContext(() =>
-      this.runCmd(args.join(' '), { user: options?.user })
-    )
+    args.push(shellQuote(src.toString()), shellQuote(dest.toString()))
+    return this.runCmd(args.join(' '), { user: options?.user })
   }
 
   runCmd(command: string, options?: { user?: string }): TemplateBuilder
@@ -755,11 +782,9 @@ export class TemplateBase
       args.push('.')
     }
 
-    return this.runInNewStackTraceContext(() =>
-      this.runCmd(args.join(' '), {
-        user: g ? 'root' : undefined,
-      })
-    )
+    return this.runCmd(args.join(' '), {
+      user: g ? 'root' : undefined,
+    })
   }
 
   npmInstall(
@@ -782,11 +807,9 @@ export class TemplateBase
       args.push(...packageList)
     }
 
-    return this.runInNewStackTraceContext(() =>
-      this.runCmd(args.join(' '), {
-        user: options?.g ? 'root' : undefined,
-      })
-    )
+    return this.runCmd(args.join(' '), {
+      user: options?.g ? 'root' : undefined,
+    })
   }
 
   bunInstall(
@@ -809,11 +832,9 @@ export class TemplateBase
       args.push(...packageList)
     }
 
-    return this.runInNewStackTraceContext(() =>
-      this.runCmd(args.join(' '), {
-        user: options?.g ? 'root' : undefined,
-      })
-    )
+    return this.runCmd(args.join(' '), {
+      user: options?.g ? 'root' : undefined,
+    })
   }
 
   aptInstall(
@@ -821,16 +842,14 @@ export class TemplateBase
     options?: { noInstallRecommends?: boolean; fixMissing?: boolean }
   ): TemplateBuilder {
     const packageList = Array.isArray(packages) ? packages : [packages]
-    return this.runInNewStackTraceContext(() =>
-      this.runCmd(
-        [
-          'apt-get update',
-          `DEBIAN_FRONTEND=noninteractive DEBCONF_NOWARNINGS=yes apt-get install -y ${options?.noInstallRecommends ? '--no-install-recommends ' : ''}${options?.fixMissing ? '--fix-missing ' : ''}${packageList.join(
-            ' '
-          )}`,
-        ],
-        { user: 'root' }
-      )
+    return this.runCmd(
+      [
+        'apt-get update',
+        `DEBIAN_FRONTEND=noninteractive DEBCONF_NOWARNINGS=yes apt-get install -y ${options?.noInstallRecommends ? '--no-install-recommends ' : ''}${options?.fixMissing ? '--fix-missing ' : ''}${packageList.join(
+          ' '
+        )}`,
+      ],
+      { user: 'root' }
     )
   }
 
@@ -838,16 +857,14 @@ export class TemplateBase
     if (this.baseTemplate !== 'mcp-gateway') {
       throw new BuildError(
         'MCP servers can only be added to mcp-gateway template',
-        getCallerFrame(STACK_TRACE_DEPTH - 1)
+        getCallerFrame()
       )
     }
 
     const serverList = Array.isArray(servers) ? servers : [servers]
-    return this.runInNewStackTraceContext(() =>
-      this.runCmd(`mcp-gateway pull ${serverList.join(' ')}`, {
-        user: 'root',
-      })
-    )
+    return this.runCmd(`mcp-gateway pull ${serverList.join(' ')}`, {
+      user: 'root',
+    })
   }
 
   gitClone(
@@ -855,21 +872,19 @@ export class TemplateBase
     path?: PathLike,
     options?: { branch?: string; depth?: number; user?: string }
   ): TemplateBuilder {
-    const args = ['git', 'clone', url]
+    const args = ['git', 'clone', shellQuote(url)]
     if (options?.branch) {
-      args.push(`--branch ${options.branch}`)
+      args.push(`--branch ${shellQuote(options.branch)}`)
       args.push('--single-branch')
     }
     if (options?.depth) {
       args.push(`--depth ${options.depth}`)
     }
     if (path) {
-      args.push(path.toString())
+      args.push(shellQuote(path.toString()))
     }
 
-    return this.runInNewStackTraceContext(() =>
-      this.runCmd(args.join(' '), { user: options?.user })
-    )
+    return this.runCmd(args.join(' '), { user: options?.user })
   }
 
   setStartCmd(
@@ -922,96 +937,43 @@ export class TemplateBase
     if (this.baseTemplate !== 'devcontainer') {
       throw new BuildError(
         'Devcontainers can only used in the devcontainer template',
-        getCallerFrame(STACK_TRACE_DEPTH - 1)
+        getCallerFrame()
       )
     }
 
-    return this.runInNewStackTraceContext(() => {
-      return this.runCmd(
-        `devcontainer build --workspace-folder ${devcontainerDirectory}`,
-        { user: 'root' }
-      )
-    })
+    return this.runCmd(
+      `devcontainer build --workspace-folder ${shellQuote(devcontainerDirectory)}`,
+      { user: 'root' }
+    )
   }
 
   betaSetDevContainerStart(devcontainerDirectory: string): TemplateFinal {
     if (this.baseTemplate !== 'devcontainer') {
       throw new BuildError(
         'Devcontainers can only used in the devcontainer template',
-        getCallerFrame(STACK_TRACE_DEPTH - 1)
+        getCallerFrame()
       )
     }
 
-    return this.runInNewStackTraceContext(() => {
-      return this.setStartCmd(
-        `sudo devcontainer up --workspace-folder ${devcontainerDirectory} && sudo /prepare-exec.sh ${devcontainerDirectory} | sudo tee /devcontainer.sh > /dev/null && sudo chmod +x /devcontainer.sh && sudo touch /devcontainer.up`,
-        waitForFile('/devcontainer.up')
-      )
-    })
+    const dir = shellQuote(devcontainerDirectory)
+    return this.setStartCmd(
+      `sudo devcontainer up --workspace-folder ${dir} && sudo /prepare-exec.sh ${dir} | sudo tee /devcontainer.sh > /dev/null && sudo chmod +x /devcontainer.sh && sudo touch /devcontainer.up`,
+      waitForFile('/devcontainer.up')
+    )
   }
 
   /**
    * Collect the current stack trace for debugging purposes.
    *
-   * @param stackTracesDepth Depth to traverse in the call stack
-   * @returns this for method chaining
-   */
-  private collectStackTrace(stackTracesDepth: number = STACK_TRACE_DEPTH) {
-    if (!this.stackTracesEnabled) {
-      return this
-    }
-
-    if (this.stackTracesOverride) {
-      this.stackTraces.push(this.stackTracesOverride)
-      return this
-    }
-
-    this.stackTraces.push(getCallerFrame(stackTracesDepth))
-    return this
-  }
-
-  /**
-   * Temporarily disable stack trace collection.
+   * The trace resolves to the first frame outside the SDK, so methods that
+   * delegate to other builder methods (e.g. `remove()` → `runCmd()`) collect
+   * the user's call site without any bookkeeping.
    *
    * @returns this for method chaining
    */
-  private disableStackTrace() {
-    this.stackTracesEnabled = false
+  private collectStackTrace() {
+    this.stackTraces.push(getCallerFrame())
     return this
-  }
-
-  /**
-   * Re-enable stack trace collection.
-   *
-   * @returns this for method chaining
-   */
-  private enableStackTrace() {
-    this.stackTracesEnabled = true
-    return this
-  }
-
-  /**
-   * Execute a function in a clean stack trace context.
-   *
-   * @param fn Function to execute
-   * @returns The result of the function
-   */
-  private runInNewStackTraceContext<T>(fn: () => T): T {
-    this.disableStackTrace()
-    const result = fn()
-    this.enableStackTrace()
-    this.collectStackTrace(STACK_TRACE_DEPTH + 1)
-    return result
-  }
-
-  private runInStackTraceOverrideContext<T>(
-    fn: () => T,
-    stackTraceOverride: string | undefined
-  ): T {
-    this.stackTracesOverride = stackTraceOverride
-    const result = fn()
-    this.stackTracesOverride = undefined
-    return result
   }
 
   /**
@@ -1173,6 +1135,7 @@ export class TemplateBase
                 ...readDockerignore(this.fileContextPath.toString()),
               ],
               resolveSymlinks: instruction.resolveSymlinks ?? RESOLVE_SYMLINKS,
+              gzip: instruction.gzip ?? GZIP,
             },
             stackTrace,
             // Forward `requestTimeoutMs` only when the caller set it — we
@@ -1303,10 +1266,16 @@ export class TemplateBase
 }
 
 /**
- * Create a new E2B template builder instance.
+ * Builder and API entrypoint for E2B sandbox templates.
  *
- * @param options Optional configuration for the template builder
- * @returns A new template builder instance
+ * `Template` is the {@link TemplateBase} class, wrapped so it can also be
+ * called as a factory returning a builder. The statics (`Template.build`,
+ * `Template.exists`, …) resolve their connection options off the class they are
+ * called on — so a subclass can bind its own defaults.
+ *
+ * @param options Optional builder options, e.g. the file context path used to
+ *   resolve relative paths passed to `copy`
+ * @returns A template builder
  *
  * @example
  * ```ts
@@ -1320,20 +1289,7 @@ export class TemplateBase
  * await Template.build(template, 'my-python-app:v1.0')
  * ```
  */
-export function Template(options?: TemplateOptions): TemplateFromImage {
-  return new TemplateBase(options)
-}
-
-Template.build = TemplateBase.build
-Template.buildInBackground = TemplateBase.buildInBackground
-Template.getBuildStatus = TemplateBase.getBuildStatus
-Template.exists = TemplateBase.exists
-Template.aliasExists = TemplateBase.aliasExists
-Template.assignTags = TemplateBase.assignTags
-Template.removeTags = TemplateBase.removeTags
-Template.getTags = TemplateBase.getTags
-Template.toJSON = TemplateBase.toJSON
-Template.toDockerfile = TemplateBase.toDockerfile
+export const Template = callableTemplate(TemplateBase)
 
 export type {
   BuildInfo,

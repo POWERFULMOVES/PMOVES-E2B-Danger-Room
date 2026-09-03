@@ -7,7 +7,7 @@ from e2b.api.client.client import AuthenticatedClient
 from e2b.connection_config import ApiParams, ConnectionConfig
 
 from e2b.api.client_sync import get_api_client
-from e2b.template.consts import RESOLVE_SYMLINKS
+from e2b.template.consts import GZIP, RESOLVE_SYMLINKS
 from e2b.template.logger import LogEntry, LogEntryEnd, LogEntryStart
 from e2b.template.main import TemplateBase, TemplateClass
 from e2b.template.types import BuildInfo, InstructionType, TemplateTag, TemplateTagInfo
@@ -41,6 +41,7 @@ class Template(TemplateBase):
         memory_mb: int = 1024,
         skip_cache: bool = False,
         on_build_logs: Optional[Callable[[LogEntry], None]] = None,
+        request_timeout: Optional[float] = None,
     ) -> BuildInfo:
         """
         Internal implementation of the template build process
@@ -100,7 +101,12 @@ class Template(TemplateBase):
             src = args[0] if len(args) > 0 else None
             force_upload = file_upload.get("forceUpload")
             files_hash = file_upload.get("filesHash", None)
-            resolve_symlinks = file_upload.get("resolveSymlinks", RESOLVE_SYMLINKS)
+            resolve_symlinks = file_upload.get("resolveSymlinks")
+            if resolve_symlinks is None:
+                resolve_symlinks = RESOLVE_SYMLINKS
+            gzip = file_upload.get("gzip")
+            if gzip is None:
+                gzip = GZIP
 
             if src is None or files_hash is None:
                 raise ValueError("Source path and files hash are required")
@@ -126,7 +132,9 @@ class Template(TemplateBase):
                         *read_dockerignore(template._template._file_context_path),
                     ],
                     resolve_symlinks,
+                    gzip,
                     stack_trace,
+                    request_timeout=request_timeout,
                 )
                 if on_build_logs:
                     on_build_logs(
@@ -180,8 +188,9 @@ class Template(TemplateBase):
             tags=response_tags,
         )
 
-    @staticmethod
+    @classmethod
     def build(
+        cls,
         template: TemplateClass,
         name: Optional[str] = None,
         *,
@@ -234,14 +243,14 @@ class Template(TemplateBase):
                     )
                 )
 
-            config = ConnectionConfig(**opts)
+            api_params = cls._resolve_api_params(**opts)
+
+            config = ConnectionConfig(**api_params)
             api_client = get_api_client(
                 config,
-                require_api_key=True,
-                require_access_token=False,
             )
 
-            data = Template._build(
+            data = cls._build(
                 api_client,
                 template,
                 name,
@@ -250,6 +259,9 @@ class Template(TemplateBase):
                 memory_mb=memory_mb,
                 skip_cache=skip_cache,
                 on_build_logs=on_build_logs,
+                # Only honor an explicitly set request_timeout for uploads;
+                # otherwise upload_file applies its 1-hour default.
+                request_timeout=api_params.get("request_timeout"),
             )
 
             if on_build_logs:
@@ -266,7 +278,7 @@ class Template(TemplateBase):
                 data.template_id,
                 data.build_id,
                 on_build_logs,
-                logs_refresh_frequency=TemplateBase._logs_refresh_frequency,
+                logs_refresh_frequency=cls._logs_refresh_frequency,
                 stack_traces=template._template._stack_traces,
             )
 
@@ -280,8 +292,9 @@ class Template(TemplateBase):
                     )
                 )
 
-    @staticmethod
+    @classmethod
     def build_in_background(
+        cls,
         template: TemplateClass,
         name: Optional[str] = None,
         *,
@@ -325,14 +338,13 @@ class Template(TemplateBase):
         """
         name = normalize_build_arguments(name, alias)
 
-        config = ConnectionConfig(**opts)
+        api_params = cls._resolve_api_params(**opts)
+        config = ConnectionConfig(**api_params)
         api_client = get_api_client(
             config,
-            require_api_key=True,
-            require_access_token=False,
         )
 
-        return Template._build(
+        return cls._build(
             api_client,
             template,
             name,
@@ -341,10 +353,14 @@ class Template(TemplateBase):
             memory_mb=memory_mb,
             skip_cache=skip_cache,
             on_build_logs=on_build_logs,
+            # Only honor an explicitly set request_timeout for uploads;
+            # otherwise upload_file applies its 1-hour default.
+            request_timeout=api_params.get("request_timeout"),
         )
 
-    @staticmethod
+    @classmethod
     def get_build_status(
+        cls,
         build_info: BuildInfo,
         logs_offset: int = 0,
         **opts: Unpack[ApiParams],
@@ -364,11 +380,9 @@ class Template(TemplateBase):
         status = Template.get_build_status(build_info, logs_offset=0)
         ```
         """
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
         api_client = get_api_client(
             config,
-            require_api_key=True,
-            require_access_token=False,
         )
 
         return get_build_status(
@@ -378,8 +392,9 @@ class Template(TemplateBase):
             logs_offset,
         )
 
-    @staticmethod
+    @classmethod
     def exists(
+        cls,
         name: str,
         **opts: Unpack[ApiParams],
     ) -> bool:
@@ -399,10 +414,11 @@ class Template(TemplateBase):
         ```
         """
 
-        return Template.alias_exists(name, **opts)
+        return cls.alias_exists(name, **opts)
 
-    @staticmethod
+    @classmethod
     def alias_exists(
+        cls,
         alias: str,
         **opts: Unpack[ApiParams],
     ) -> bool:
@@ -423,17 +439,16 @@ class Template(TemplateBase):
             print('Template exists!')
         ```
         """
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
         api_client = get_api_client(
             config,
-            require_api_key=True,
-            require_access_token=False,
         )
 
         return check_alias_exists(api_client, alias)
 
-    @staticmethod
+    @classmethod
     def assign_tags(
+        cls,
         target_name: str,
         tags: Union[str, List[str]],
         **opts: Unpack[ApiParams],
@@ -456,18 +471,17 @@ class Template(TemplateBase):
         result = Template.assign_tags('my-template:v1.0', ['production', 'stable'])
         ```
         """
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
         api_client = get_api_client(
             config,
-            require_api_key=True,
-            require_access_token=False,
         )
 
         normalized_tags = [tags] if isinstance(tags, str) else tags
         return assign_tags(api_client, target_name, normalized_tags)
 
-    @staticmethod
+    @classmethod
     def remove_tags(
+        cls,
         name: str,
         tags: Union[str, List[str]],
         **opts: Unpack[ApiParams],
@@ -489,18 +503,17 @@ class Template(TemplateBase):
         Template.remove_tags('my-template', ['production', 'stable'])
         ```
         """
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
         api_client = get_api_client(
             config,
-            require_api_key=True,
-            require_access_token=False,
         )
 
         normalized_tags = [tags] if isinstance(tags, str) else tags
         remove_tags(api_client, name, normalized_tags)
 
-    @staticmethod
+    @classmethod
     def get_tags(
+        cls,
         template_id: str,
         **opts: Unpack[ApiParams],
     ) -> List[TemplateTag]:
@@ -519,11 +532,9 @@ class Template(TemplateBase):
             print(f"Tag: {tag.tag}, Build: {tag.build_id}, Created: {tag.created_at}")
         ```
         """
-        config = ConnectionConfig(**opts)
+        config = ConnectionConfig(**cls._resolve_api_params(**opts))
         api_client = get_api_client(
             config,
-            require_api_key=True,
-            require_access_token=False,
         )
 
         return get_template_tags(api_client, template_id)

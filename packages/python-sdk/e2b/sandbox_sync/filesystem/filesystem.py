@@ -1,11 +1,11 @@
-from io import IOBase, TextIOBase
-from typing import IO, Iterator, List, Literal, Optional, Union, overload
+from typing import IO, Dict, List, Literal, Optional, Union, overload
 
-import httpcore
 import httpx
+from connectrpc.code import Code
+from connectrpc.errors import ConnectError
 from packaging.version import Version
 
-import e2b_connect
+from e2b.api.client_sync import get_envd_api
 from e2b.connection_config import (
     KEEPALIVE_PING_HEADER,
     KEEPALIVE_PING_INTERVAL_SEC,
@@ -13,15 +13,24 @@ from e2b.connection_config import (
     Username,
     default_username,
 )
-from e2b_connect.client import Code
 
-from e2b.envd.api import ENVD_API_FILES_ROUTE, handle_envd_api_exception
-from e2b.envd.filesystem import filesystem_connect, filesystem_pb2
-from e2b.envd.rpc import authentication_header, handle_rpc_exception
+from e2b.envd.api import (
+    ENVD_API_FILES_ROUTE,
+    check_sandbox_health,
+    handle_envd_api_exception,
+    handle_envd_api_transport_exception_with_health,
+)
+from e2b.envd.filesystem import filesystem_connect, filesystem_pb
+from e2b.envd.rpc import handle_rpc_exception_with_health
+from e2b.envd.utils import authentication_header, timeout_to_ms
+from e2b.envd.client_sync import create_rpc_client
 from e2b.envd.versions import (
     ENVD_DEFAULT_USER,
+    ENVD_FILE_METADATA,
     ENVD_OCTET_STREAM_UPLOAD,
+    ENVD_VERSION_FS_EVENT_ENTRY_INFO,
     ENVD_VERSION_RECURSIVE_WATCH,
+    ENVD_VERSION_WATCH_NETWORK_MOUNTS,
 )
 from e2b.exceptions import (
     FileNotFoundException,
@@ -31,16 +40,22 @@ from e2b.exceptions import (
 )
 from e2b.sandbox.filesystem.filesystem import (
     EntryInfo,
+    FileStreamReader,
     WriteEntry,
     WriteInfo,
+    _to_httpx_file,
+    multipart_body_is_streamed,
+    map_entry_info,
     map_file_type,
+    metadata_to_headers,
     to_upload_body,
+    validate_metadata,
 )
 from e2b.sandbox_sync.filesystem.watch_handle import WatchHandle
 
 
 _FILESYSTEM_RPC_ERROR_MAP = {
-    Code.not_found: FileNotFoundException,
+    Code.NOT_FOUND: FileNotFoundException,
 }
 
 _FILESYSTEM_HTTP_ERROR_MAP = {
@@ -48,8 +63,10 @@ _FILESYSTEM_HTTP_ERROR_MAP = {
 }
 
 
-def _handle_filesystem_rpc_exception(e: Exception) -> Exception:
-    return handle_rpc_exception(e, _FILESYSTEM_RPC_ERROR_MAP)
+def _handle_filesystem_rpc_exception(e: Exception, envd_api: httpx.Client) -> Exception:
+    return handle_rpc_exception_with_health(
+        e, lambda: check_sandbox_health(envd_api), _FILESYSTEM_RPC_ERROR_MAP
+    )
 
 
 def _handle_filesystem_envd_api_exception(r):
@@ -66,22 +83,23 @@ class Filesystem:
         envd_api_url: str,
         envd_version: Version,
         connection_config: ConnectionConfig,
-        pool: httpcore.ConnectionPool,
         envd_api: httpx.Client,
     ) -> None:
         self._envd_api_url = envd_api_url
         self._envd_version = envd_version
         self._connection_config = connection_config
-        self._pool = pool
-        self._envd_api = envd_api
-
-        self._rpc = filesystem_connect.FilesystemClient(
+        self._rpc = create_rpc_client(
+            filesystem_connect.FilesystemClientSync,
             envd_api_url,
-            # TODO: Fix and enable compression again — the headers compression is not solved for streaming.
-            # compressor=e2b_connect.GzipCompressor,
-            pool=pool,
-            json=True,
-            headers=connection_config.sandbox_headers,
+            connection_config,
+        )
+        self._envd_api = envd_api
+        # Streamed downloads default to a sibling client whose transport
+        # carries the idle read timeout (see `get_transport`). Like the
+        # RPC client, the pyqwest transports underneath are thread-safe, so
+        # one client serves all threads.
+        self._envd_api_streaming = get_envd_api(
+            connection_config, envd_api_url, for_streaming=True
         )
 
     @overload
@@ -136,17 +154,30 @@ class Filesystem:
         user: Optional[Username] = None,
         request_timeout: Optional[float] = None,
         gzip: bool = False,
-    ) -> Iterator[bytes]:
+        stream_idle_timeout: Optional[float] = None,
+    ) -> FileStreamReader:
         """
-        Read file content as a `Iterator[bytes]`.
+        Read file content as a `FileStreamReader` (an `Iterator[bytes]`).
+
+        A `request_timeout` set explicitly for this call is the deadline for
+        the whole transfer; by default the download is not bounded in total.
+        A stalled stream is reclaimed by a transport-wide idle read timeout
+        (raising `httpx.ReadTimeout`). The reader releases its connection
+        once fully consumed; if you don't read it to the end, use it as a
+        context manager or call `close()` for deterministic cleanup.
 
         :param path: Path to the file
         :param user: Run the operation as this user
         :param format: Format of the file content—`stream`
-        :param request_timeout: Timeout for the request in **seconds**
+        :param request_timeout: Deadline for the whole transfer in **seconds**
         :param gzip: Use gzip compression for the request
+        :param stream_idle_timeout: Ignored — the sync client cannot
+            interrupt a blocking read. A stalled streamed read is bounded by
+            a transport-wide idle read timeout instead (60 seconds), which
+            resets on every chunk. (`AsyncSandbox.files.read` honors this
+            parameter.)
 
-        :return: File content as an `Iterator[bytes]`
+        :return: File content as a `FileStreamReader`
         """
         ...
 
@@ -157,6 +188,7 @@ class Filesystem:
         user: Optional[Username] = None,
         request_timeout: Optional[float] = None,
         gzip: bool = False,
+        stream_idle_timeout: Optional[float] = None,
     ):
         username = user
         if username is None and self._envd_version < ENVD_DEFAULT_USER:
@@ -170,12 +202,47 @@ class Filesystem:
         if gzip:
             headers["Accept-Encoding"] = "gzip"
 
-        r = self._envd_api.get(
-            ENVD_API_FILES_ROUTE,
-            params=params,
-            headers=headers,
-            timeout=self._connection_config.get_request_timeout(request_timeout),
-        )
+        timeout = self._connection_config.get_request_timeout(request_timeout)
+
+        if format == "stream":
+            # Stream the response body instead of buffering it in memory.
+            # Through the pyqwest adapter a per-request timeout is a
+            # whole-request deadline that would kill long downloads, so it is
+            # sent only when the caller set `request_timeout` explicitly
+            # (making it the total-transfer deadline). A stalled stream is
+            # instead bounded by the streaming transport's idle read timeout
+            # (see `get_transport`), which resets on every chunk.
+            stream_timeout = ConnectionConfig._get_request_timeout(
+                None, request_timeout
+            )
+            request = self._envd_api_streaming.build_request(
+                "GET",
+                ENVD_API_FILES_ROUTE,
+                params=params,
+                headers=headers,
+                timeout=stream_timeout,
+            )
+            try:
+                r = self._envd_api_streaming.send(request, stream=True)
+            except httpx.RemoteProtocolError as e:
+                raise handle_envd_api_transport_exception_with_health(e, self._envd_api)
+
+            err = _handle_filesystem_envd_api_exception(r)
+            if err:
+                r.close()
+                raise err
+
+            return FileStreamReader(r)
+
+        try:
+            r = self._envd_api.get(
+                ENVD_API_FILES_ROUTE,
+                params=params,
+                headers=headers,
+                timeout=timeout,
+            )
+        except httpx.RemoteProtocolError as e:
+            raise handle_envd_api_transport_exception_with_health(e, self._envd_api)
 
         err = _handle_filesystem_envd_api_exception(r)
         if err:
@@ -185,8 +252,6 @@ class Filesystem:
             return r.text
         elif format == "bytes":
             return bytearray(r.content)
-        elif format == "stream":
-            return r.iter_bytes()
 
     def write(
         self,
@@ -195,7 +260,8 @@ class Filesystem:
         user: Optional[Username] = None,
         request_timeout: Optional[float] = None,
         gzip: bool = False,
-        use_octet_stream: bool = False,
+        use_octet_stream: Optional[bool] = None,
+        metadata: Optional[Dict[str, str]] = None,
     ) -> WriteInfo:
         """
         Write content to a file on the path.
@@ -204,11 +270,12 @@ class Filesystem:
         Writing to a file at path that doesn't exist creates the necessary directories.
 
         :param path: Path to the file
-        :param data: Data to write to the file, can be a `str`, `bytes`, or `IO`.
+        :param data: Data to write to the file, can be a `str`, `bytes`, or `IO`. File-like objects are streamed in chunks instead of being buffered in memory.
         :param user: Run the operation as this user
         :param request_timeout: Timeout for the request in **seconds**
-        :param gzip: Use gzip compression for the request
-        :param use_octet_stream: Upload using `application/octet-stream` instead of `multipart/form-data`. Defaults to `False`. Requires envd 0.5.7 or later — when not supported, the upload falls back to `multipart/form-data`.
+        :param gzip: Use gzip compression for the upload. Implies the `application/octet-stream` upload. Requires envd 0.5.7 or later — when not supported, the upload falls back to uncompressed `multipart/form-data`.
+        :param use_octet_stream: Upload using `application/octet-stream` instead of `multipart/form-data`. Defaults to `None`, which uses octet-stream when `data` is a file-like object (so streamed uploads aren't buffered) and `multipart/form-data` otherwise. Requires envd 0.5.7 or later — when not supported, the upload falls back to `multipart/form-data`, which reads text-mode file-like data into memory (httpx only streams binary file objects in a multipart body).
+        :param metadata: User-defined metadata to persist on the uploaded file as extended attributes. Keys are lowercased by the sandbox; invalid keys or values raise an `InvalidArgumentException`. Requires envd 0.6.2 or later.
 
         :return: Information about the written file
         """
@@ -218,6 +285,7 @@ class Filesystem:
             request_timeout=request_timeout,
             gzip=gzip,
             use_octet_stream=use_octet_stream,
+            metadata=metadata,
         )
 
         if len(result) != 1:
@@ -231,9 +299,12 @@ class Filesystem:
         user: Optional[Username] = None,
         request_timeout: Optional[float] = None,
         gzip: bool = False,
-        use_octet_stream: bool = False,
+        use_octet_stream: Optional[bool] = None,
+        metadata: Optional[Dict[str, str]] = None,
     ) -> List[WriteInfo]:
         """
+        Writes multiple files.
+
         Writes a list of files to the filesystem.
         When writing to a file that doesn't exist, the file will get created.
         When writing to a file that already exists, the file will get overwritten.
@@ -242,8 +313,9 @@ class Filesystem:
         :param files: list of files to write as `WriteEntry` objects, each containing `path` and `data`
         :param user: Run the operation as this user
         :param request_timeout: Timeout for the request
-        :param gzip: Use gzip compression for the request
-        :param use_octet_stream: Upload using `application/octet-stream` instead of `multipart/form-data`. Defaults to `False`. Requires envd 0.5.7 or later — when not supported, the upload falls back to `multipart/form-data`.
+        :param gzip: Use gzip compression for the upload. Implies the `application/octet-stream` upload. Requires envd 0.5.7 or later — when not supported, the upload falls back to uncompressed `multipart/form-data`.
+        :param use_octet_stream: Upload using `application/octet-stream` instead of `multipart/form-data`. Defaults to `None`, which uses octet-stream when any entry is a file-like object (so streamed uploads aren't buffered) and `multipart/form-data` otherwise. Requires envd 0.5.7 or later — when not supported, the upload falls back to `multipart/form-data`, which reads text-mode file-like data into memory (httpx only streams binary file objects in a multipart body).
+        :param metadata: User-defined metadata to persist on each uploaded file as extended attributes; the same map is applied to every file. Keys are lowercased by the sandbox; invalid keys or values raise an `InvalidArgumentException`. Requires envd 0.6.2 or later.
         :return: Information about the written files
         """
         username = user
@@ -253,8 +325,40 @@ class Filesystem:
         if len(files) == 0:
             return []
 
+        validate_metadata(metadata)
+
+        if metadata and self._envd_version < ENVD_FILE_METADATA:
+            raise TemplateException("File metadata requires envd 0.6.2 or later.")
+
+        # A file-like entry is streamed; str/bytes are sent from memory.
+        has_streamable_data = any(
+            not isinstance(file["data"], (str, bytes)) for file in files
+        )
+
+        if use_octet_stream is None:
+            # Streaming an upload only happens on the octet-stream path; the
+            # multipart path buffers file-like data. Default to octet-stream
+            # when any entry is a file-like object so a streamed upload isn't
+            # silently buffered.
+            use_octet_stream = has_streamable_data
+
         supports_octet_stream = self._envd_version >= ENVD_OCTET_STREAM_UPLOAD
-        use_octet_stream = use_octet_stream and supports_octet_stream
+        # Gzip compression only works with the octet-stream upload (the
+        # Content-Encoding header applies to the whole request body), so
+        # requesting gzip implies it when envd supports it.
+        use_octet_stream = (use_octet_stream or gzip) and supports_octet_stream
+
+        # A buffered upload is bounded by the request timeout as a
+        # whole-request deadline, matching the JS SDK. A streamed (file-like)
+        # upload carries no client-side timeout — a deadline would kill any
+        # transfer outlasting it, and a stalled producer is the caller's own
+        # code — so a stuck streamed upload is bounded server-side (envd's
+        # per-read idle timeout, envd >= 0.6.7), also matching the JS SDK.
+        upload_timeout = self._connection_config.get_request_timeout(request_timeout)
+
+        # Metadata is sent as request-scoped X-Metadata-* headers, so the same
+        # metadata is applied to every file in a multi-file upload.
+        extra_headers = metadata_to_headers(metadata)
 
         results: List[WriteInfo] = []
 
@@ -262,25 +366,27 @@ class Filesystem:
             for file in files:
                 file_path, file_data = file["path"], file["data"]
 
-                content = to_upload_body(file_data, gzip)
-
                 params = {"path": file_path}
                 if username:
                     params["username"] = username
 
-                headers = {"Content-Type": "application/octet-stream"}
+                headers = {"Content-Type": "application/octet-stream", **extra_headers}
                 if gzip:
                     headers["Content-Encoding"] = "gzip"
 
-                r = self._envd_api.post(
-                    ENVD_API_FILES_ROUTE,
-                    content=content,
-                    headers=headers,
-                    params=params,
-                    timeout=self._connection_config.get_request_timeout(
-                        request_timeout
-                    ),
-                )
+                is_streamed = not isinstance(file_data, (str, bytes))
+                try:
+                    r = self._envd_api.post(
+                        ENVD_API_FILES_ROUTE,
+                        content=to_upload_body(file_data, gzip),
+                        headers=headers,
+                        params=params,
+                        timeout=None if is_streamed else upload_timeout,
+                    )
+                except httpx.RemoteProtocolError as e:
+                    raise handle_envd_api_transport_exception_with_health(
+                        e, self._envd_api
+                    )
 
                 err = _handle_filesystem_envd_api_exception(r)
                 if err:
@@ -293,7 +399,7 @@ class Filesystem:
                         "Expected to receive information about written file"
                     )
 
-                results.extend([WriteInfo(**f) for f in write_result])
+                results.extend([WriteInfo.from_dict(f) for f in write_result])
         else:
             params = {}
             if username:
@@ -301,29 +407,27 @@ class Filesystem:
             if len(files) == 1:
                 params["path"] = files[0]["path"]
 
-            httpx_files = []
-            for file in files:
-                file_path, file_data = file["path"], file["data"]
-                if isinstance(file_data, (str, bytes)):
-                    httpx_files.append(("file", (file_path, file_data)))
-                elif isinstance(file_data, TextIOBase):
-                    httpx_files.append(("file", (file_path, file_data.read())))
-                elif isinstance(file_data, IOBase):
-                    httpx_files.append(("file", (file_path, file_data)))
-                else:
-                    raise InvalidArgumentException(
-                        f"Unsupported data type for file {file_path}"
-                    )
+            httpx_files = [_to_httpx_file(file["path"], file["data"]) for file in files]
 
             if len(httpx_files) == 0:
                 return []
 
-            r = self._envd_api.post(
-                ENVD_API_FILES_ROUTE,
-                files=httpx_files,
-                params=params,
-                timeout=self._connection_config.get_request_timeout(request_timeout),
-            )
+            try:
+                r = self._envd_api.post(
+                    ENVD_API_FILES_ROUTE,
+                    files=httpx_files,
+                    params=params,
+                    headers=extra_headers,
+                    # Only a streamed entry drops the deadline: httpx
+                    # forwards binary `IOBase` entries in chunks, while text
+                    # file-like data was buffered by `_to_httpx_file` (httpx
+                    # rejects text-mode objects in multipart).
+                    timeout=(
+                        None if multipart_body_is_streamed(files) else upload_timeout
+                    ),
+                )
+            except httpx.RemoteProtocolError as e:
+                raise handle_envd_api_transport_exception_with_health(e, self._envd_api)
 
             err = _handle_filesystem_envd_api_exception(r)
             if err:
@@ -336,7 +440,7 @@ class Filesystem:
                     "Expected to receive information about written file"
                 )
 
-            results.extend([WriteInfo(**f) for f in write_result])
+            results.extend([WriteInfo.from_dict(f) for f in write_result])
 
         return results
 
@@ -362,41 +466,22 @@ class Filesystem:
 
         try:
             res = self._rpc.list_dir(
-                filesystem_pb2.ListDirRequest(path=path, depth=depth),
-                request_timeout=self._connection_config.get_request_timeout(
-                    request_timeout
+                filesystem_pb.ListDirRequest(path=path, depth=depth or 0),
+                timeout_ms=timeout_to_ms(
+                    self._connection_config.get_request_timeout(request_timeout)
                 ),
                 headers=authentication_header(self._envd_version, user),
             )
 
             entries: List[EntryInfo] = []
             for entry in res.entries:
-                event_type = map_file_type(entry.type)
-
-                if event_type:
-                    entries.append(
-                        EntryInfo(
-                            name=entry.name,
-                            type=event_type,
-                            path=entry.path,
-                            size=entry.size,
-                            mode=entry.mode,
-                            permissions=entry.permissions,
-                            owner=entry.owner,
-                            group=entry.group,
-                            modified_time=entry.modified_time.ToDatetime(),
-                            # Optional, we can't directly access symlink_target otherwise if will be "" instead of None
-                            symlink_target=(
-                                entry.symlink_target
-                                if entry.HasField("symlink_target")
-                                else None
-                            ),
-                        )
-                    )
+                # Skip entries with an unknown file type.
+                if map_file_type(entry.type):
+                    entries.append(map_entry_info(entry))
 
             return entries
         except Exception as e:
-            raise _handle_filesystem_rpc_exception(e)
+            raise _handle_filesystem_rpc_exception(e, self._envd_api)
 
     def exists(
         self,
@@ -415,19 +500,19 @@ class Filesystem:
         """
         try:
             self._rpc.stat(
-                filesystem_pb2.StatRequest(path=path),
-                request_timeout=self._connection_config.get_request_timeout(
-                    request_timeout
+                filesystem_pb.StatRequest(path=path),
+                timeout_ms=timeout_to_ms(
+                    self._connection_config.get_request_timeout(request_timeout)
                 ),
                 headers=authentication_header(self._envd_version, user),
             )
             return True
 
         except Exception as e:
-            if isinstance(e, e2b_connect.ConnectException):
-                if e.status == e2b_connect.Code.not_found:
+            if isinstance(e, ConnectError):
+                if e.code == Code.NOT_FOUND:
                     return False
-            raise _handle_filesystem_rpc_exception(e)
+            raise _handle_filesystem_rpc_exception(e, self._envd_api)
 
     def get_info(
         self,
@@ -446,32 +531,16 @@ class Filesystem:
         """
         try:
             r = self._rpc.stat(
-                filesystem_pb2.StatRequest(path=path),
-                request_timeout=self._connection_config.get_request_timeout(
-                    request_timeout
+                filesystem_pb.StatRequest(path=path),
+                timeout_ms=timeout_to_ms(
+                    self._connection_config.get_request_timeout(request_timeout)
                 ),
                 headers=authentication_header(self._envd_version, user),
             )
 
-            return EntryInfo(
-                name=r.entry.name,
-                type=map_file_type(r.entry.type),
-                path=r.entry.path,
-                size=r.entry.size,
-                mode=r.entry.mode,
-                permissions=r.entry.permissions,
-                owner=r.entry.owner,
-                group=r.entry.group,
-                modified_time=r.entry.modified_time.ToDatetime(),
-                # Optional, we can't directly access symlink_target otherwise if will be "" instead of None
-                symlink_target=(
-                    r.entry.symlink_target
-                    if r.entry.HasField("symlink_target")
-                    else None
-                ),
-            )
+            return map_entry_info(r.entry or filesystem_pb.EntryInfo())
         except Exception as e:
-            raise _handle_filesystem_rpc_exception(e)
+            raise _handle_filesystem_rpc_exception(e, self._envd_api)
 
     def remove(
         self,
@@ -488,14 +557,14 @@ class Filesystem:
         """
         try:
             self._rpc.remove(
-                filesystem_pb2.RemoveRequest(path=path),
-                request_timeout=self._connection_config.get_request_timeout(
-                    request_timeout
+                filesystem_pb.RemoveRequest(path=path),
+                timeout_ms=timeout_to_ms(
+                    self._connection_config.get_request_timeout(request_timeout)
                 ),
                 headers=authentication_header(self._envd_version, user),
             )
         except Exception as e:
-            raise _handle_filesystem_rpc_exception(e)
+            raise _handle_filesystem_rpc_exception(e, self._envd_api)
 
     def rename(
         self,
@@ -516,35 +585,19 @@ class Filesystem:
         """
         try:
             r = self._rpc.move(
-                filesystem_pb2.MoveRequest(
+                filesystem_pb.MoveRequest(
                     source=old_path,
                     destination=new_path,
                 ),
-                request_timeout=self._connection_config.get_request_timeout(
-                    request_timeout
+                timeout_ms=timeout_to_ms(
+                    self._connection_config.get_request_timeout(request_timeout)
                 ),
                 headers=authentication_header(self._envd_version, user),
             )
 
-            return EntryInfo(
-                name=r.entry.name,
-                type=map_file_type(r.entry.type),
-                path=r.entry.path,
-                size=r.entry.size,
-                mode=r.entry.mode,
-                permissions=r.entry.permissions,
-                owner=r.entry.owner,
-                group=r.entry.group,
-                modified_time=r.entry.modified_time.ToDatetime(),
-                # Optional, we can't directly access symlink_target otherwise if will be "" instead of None
-                symlink_target=(
-                    r.entry.symlink_target
-                    if r.entry.HasField("symlink_target")
-                    else None
-                ),
-            )
+            return map_entry_info(r.entry or filesystem_pb.EntryInfo())
         except Exception as e:
-            raise _handle_filesystem_rpc_exception(e)
+            raise _handle_filesystem_rpc_exception(e, self._envd_api)
 
     def make_dir(
         self,
@@ -563,19 +616,19 @@ class Filesystem:
         """
         try:
             self._rpc.make_dir(
-                filesystem_pb2.MakeDirRequest(path=path),
-                request_timeout=self._connection_config.get_request_timeout(
-                    request_timeout
+                filesystem_pb.MakeDirRequest(path=path),
+                timeout_ms=timeout_to_ms(
+                    self._connection_config.get_request_timeout(request_timeout)
                 ),
                 headers=authentication_header(self._envd_version, user),
             )
 
             return True
         except Exception as e:
-            if isinstance(e, e2b_connect.ConnectException):
-                if e.status == e2b_connect.Code.already_exists:
+            if isinstance(e, ConnectError):
+                if e.code == Code.ALREADY_EXISTS:
                     return False
-            raise _handle_filesystem_rpc_exception(e)
+            raise _handle_filesystem_rpc_exception(e, self._envd_api)
 
     def watch_dir(
         self,
@@ -583,6 +636,8 @@ class Filesystem:
         user: Optional[Username] = None,
         request_timeout: Optional[float] = None,
         recursive: bool = False,
+        include_entry: bool = False,
+        allow_network_mounts: bool = False,
     ) -> WatchHandle:
         """
         Watch directory for filesystem events.
@@ -591,20 +646,39 @@ class Filesystem:
         :param user: Run the operation as this user
         :param request_timeout: Timeout for the request in **seconds**
         :param recursive: Watch directory recursively
+        :param include_entry: Include the `EntryInfo` of the affected entry in each event, when available. Requires envd 0.6.3 or later
+        :param allow_network_mounts: Allow watching paths on network filesystem mounts (NFS, CIFS, SMB, FUSE), which are rejected by default. Events on network mounts may be unreliable or not delivered at all. Requires envd 0.6.4 or later
 
         :return: `WatchHandle` object for stopping watching directory
         """
         if recursive and self._envd_version < ENVD_VERSION_RECURSIVE_WATCH:
             raise TemplateException(
-                "You need to update the template to use recursive watching. "
-                "You can do this by running `e2b template build` in the directory with the template."
+                "You need to update the template to use recursive watching."
+            )
+
+        if include_entry and self._envd_version < ENVD_VERSION_FS_EVENT_ENTRY_INFO:
+            raise TemplateException(
+                "You need to update the template to include entry info in watch events."
+            )
+
+        if (
+            allow_network_mounts
+            and self._envd_version < ENVD_VERSION_WATCH_NETWORK_MOUNTS
+        ):
+            raise TemplateException(
+                "You need to update the template to watch directories on network mounts."
             )
 
         try:
             r = self._rpc.create_watcher(
-                filesystem_pb2.CreateWatcherRequest(path=path, recursive=recursive),
-                request_timeout=self._connection_config.get_request_timeout(
-                    request_timeout
+                filesystem_pb.CreateWatcherRequest(
+                    path=path,
+                    recursive=recursive,
+                    include_entry=include_entry,
+                    allow_network_mounts=allow_network_mounts,
+                ),
+                timeout_ms=timeout_to_ms(
+                    self._connection_config.get_request_timeout(request_timeout)
                 ),
                 headers={
                     **authentication_header(self._envd_version, user),
@@ -612,6 +686,13 @@ class Filesystem:
                 },
             )
         except Exception as e:
-            raise _handle_filesystem_rpc_exception(e)
+            raise _handle_filesystem_rpc_exception(e, self._envd_api)
 
-        return WatchHandle(self._rpc, r.watcher_id)
+        return WatchHandle(
+            self._rpc,
+            r.watcher_id,
+            self._connection_config,
+            self._envd_version,
+            user,
+            lambda: check_sandbox_health(self._envd_api),
+        )

@@ -6,14 +6,15 @@ import * as e2b from 'e2b'
 import { pkg } from 'src'
 import {
   DOCS_BASE,
+  getConfigRefreshTimestamp,
   getUserConfig,
+  writeUserConfig,
   USER_CONFIG_PATH,
   UserConfig,
-  writeUserConfig,
 } from 'src/user'
 import { asBold, asFormattedConfig, asFormattedError } from 'src/utils/format'
 import { openUrlInBrowser } from 'src/utils/openBrowser'
-import { connectionConfig } from 'src/api'
+import { connectionConfig, Teams } from 'src/api'
 import { handleE2BRequestError } from '../../utils/errors'
 
 export const loginCommand = new commander.Command('login')
@@ -30,7 +31,7 @@ export const loginCommand = new commander.Command('login')
       console.log(
         `\nAlready logged in. ${asFormattedConfig(
           userConfig
-        )}.\n\nIf you want to log in as a different user, log out first by running 'e2b auth logout'.\nTo change the team, run 'e2b auth configure'.\n`
+        )}.\n\nIf you want to log in as a different user, log out first by running 'e2b auth logout'.\nTo change the project, run 'e2b auth configure'.\n`
       )
       return
     } else if (!userConfig) {
@@ -41,43 +42,55 @@ export const loginCommand = new commander.Command('login')
         return
       }
 
-      const accessToken =
-        process.env.E2B_ACCESS_TOKEN || signInResponse.accessToken
+      const accessToken = signInResponse.accessToken
 
       const signal = connectionConfig.getSignal()
       const config = new e2b.ConnectionConfig({
-        accessToken,
+        apiHeaders: { Authorization: `Bearer ${accessToken}` },
       })
-      const client = new e2b.ApiClient(config)
-      const res = await client.api.GET('/teams', { signal })
+      const client = new e2b.ApiClient(config, { requireApiKey: false })
+      const res = await client.api.GET('/teams', {
+        signal,
+      })
 
-      handleE2BRequestError(res, 'Error getting teams')
+      handleE2BRequestError(res, 'Error getting projects')
+      const teams = res.data as Teams
 
-      const defaultTeam = res.data.find(
-        (team: e2b.components['schemas']['Team']) => team.isDefault
-      )
+      const defaultTeam = teams.find((team) => team.isDefault)
       if (!defaultTeam) {
         console.error(
-          asFormattedError('No default team found, please contact support')
+          asFormattedError('No default project found, please contact support')
         )
         process.exit(1)
       }
 
       userConfig = {
-        email: signInResponse.email,
-        accessToken,
-        teamName: defaultTeam.name,
-        teamId: defaultTeam.teamID,
-        teamApiKey: defaultTeam.apiKey,
+        version: 2,
+        identity: {
+          email: signInResponse.email,
+        },
+        oauth: {
+          token_endpoint: signInResponse.tokenEndpoint,
+          revoke_endpoint: signInResponse.revokeEndpoint,
+          client_id: signInResponse.clientId,
+        },
+        tokens: {
+          access_token: accessToken,
+          refresh_token: signInResponse.refreshToken,
+        },
+        last_refresh: getConfigRefreshTimestamp(),
+        projectName: defaultTeam.name,
+        projectId: defaultTeam.teamID,
+        projectApiKey: defaultTeam.apiKey,
       }
 
       writeUserConfig(USER_CONFIG_PATH, userConfig)
     }
 
     console.log(
-      `Logged in as ${asBold(userConfig.email)} with selected team ${asBold(
-        userConfig.teamName
-      )}`
+      `Logged in as ${asBold(
+        userConfig.identity.email
+      )} with selected project ${asBold(userConfig.projectName)}`
     )
     process.exit(0)
   })
@@ -85,7 +98,10 @@ export const loginCommand = new commander.Command('login')
 interface SignInWithBrowserResponse {
   email: string
   accessToken: string
-  defaultTeamId: string
+  refreshToken: string
+  tokenEndpoint: string
+  revokeEndpoint: string
+  clientId: string
 }
 
 async function signInWithBrowser(): Promise<SignInWithBrowserResponse> {
@@ -112,6 +128,20 @@ async function signInWithBrowser(): Promise<SignInWithBrowserResponse> {
         reject(new Error(error))
         followUpUrl.searchParams.set('state', 'error')
         followUpUrl.searchParams.set('error', error)
+      } else if (
+        !searchParamsObj.email ||
+        !searchParamsObj.accessToken ||
+        !searchParamsObj.refreshToken ||
+        !searchParamsObj.tokenEndpoint ||
+        !searchParamsObj.revokeEndpoint ||
+        !searchParamsObj.clientId
+      ) {
+        reject(new Error('Incomplete login response from server'))
+        followUpUrl.searchParams.set('state', 'error')
+        followUpUrl.searchParams.set(
+          'error',
+          'Incomplete login response from server'
+        )
       } else {
         resolve(searchParamsObj)
         followUpUrl.searchParams.set('state', 'success')

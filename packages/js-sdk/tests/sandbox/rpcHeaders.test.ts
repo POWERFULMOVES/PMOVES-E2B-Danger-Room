@@ -18,8 +18,10 @@ vi.mock('../../src/envd/http2', () => ({
 }))
 
 test('does not pass custom connection headers to envd RPC requests', async () => {
-  const { Sandbox } = await import('../../src')
+  const { ConnectionConfig, Sandbox } = await import('../../src')
+  const config = new ConnectionConfig()
   const sandbox = new Sandbox({
+    ...config,
     sandboxId: 'sbx-test',
     sandboxDomain: 'sandbox.e2b.dev',
     envdVersion: '0.2.4',

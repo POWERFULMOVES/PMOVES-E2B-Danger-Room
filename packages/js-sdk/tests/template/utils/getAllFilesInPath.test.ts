@@ -1,14 +1,15 @@
 import { expect, test, describe, beforeAll, afterAll, beforeEach } from 'vitest'
-import { writeFile, mkdir, rm } from 'fs/promises'
+import { writeFile, mkdir, mkdtemp, rm } from 'fs/promises'
+import { tmpdir } from 'os'
 import { join, basename } from 'path'
 import { getAllFilesInPath } from '../../../src/template/utils'
 
 describe('getAllFilesInPath', () => {
-  const testDir = join(__dirname, 'folder')
+  // A temp directory, so a test run never writes into the repository tree.
+  let testDir: string
 
   beforeAll(async () => {
-    await rm(testDir, { recursive: true, force: true })
-    await mkdir(testDir, { recursive: true })
+    testDir = await mkdtemp(join(tmpdir(), 'getAllFilesInPath-test-'))
   })
 
   afterAll(async () => {
@@ -195,9 +196,23 @@ describe('getAllFilesInPath', () => {
     const files = await getAllFilesInPath('*.txt', testDir, [])
 
     expect(files).toHaveLength(3)
-    // Files are sorted by full path, not just filename
-    const fileNames = files.map((f) => basename(f.fullpath())).sort()
+    // Files must be returned sorted by full path so the files hash is
+    // independent of filesystem traversal order
+    const fileNames = files.map((f) => basename(f.fullpath()))
     expect(fileNames).toEqual(['apple.txt', 'banana.txt', 'zebra.txt'])
+  })
+
+  test('should return nested files sorted by full path', async () => {
+    await mkdir(join(testDir, 'b'), { recursive: true })
+    await mkdir(join(testDir, 'a'), { recursive: true })
+    await writeFile(join(testDir, 'zebra.txt'), 'z content')
+    await writeFile(join(testDir, 'b', 'file.txt'), 'b content')
+    await writeFile(join(testDir, 'a', 'file.txt'), 'a content')
+
+    const files = await getAllFilesInPath('*', testDir, [])
+
+    const paths = files.map((f) => f.fullpath())
+    expect(paths).toEqual([...paths].sort())
   })
 
   test('should handle no matching files', async () => {

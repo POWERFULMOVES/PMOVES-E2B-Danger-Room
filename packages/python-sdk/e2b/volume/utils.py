@@ -1,8 +1,16 @@
+import datetime
 from typing import Optional
 
 from e2b.volume.client.models import VolumeEntryStat as VolumeEntryStatApi
 from e2b.volume.client.types import UNSET
 from e2b.volume.types import VolumeEntryStat
+
+
+def _ensure_utc(dt: datetime.datetime) -> datetime.datetime:
+    """Mark a timezone-naive datetime as UTC (API timestamps are UTC)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=datetime.timezone.utc)
+    return dt
 
 
 def convert_volume_entry_stat(api_stat: VolumeEntryStatApi) -> VolumeEntryStat:
@@ -19,9 +27,9 @@ def convert_volume_entry_stat(api_stat: VolumeEntryStatApi) -> VolumeEntryStat:
         mode=api_stat.mode,
         uid=api_stat.uid,
         gid=api_stat.gid,
-        atime=api_stat.atime,
-        mtime=api_stat.mtime,
-        ctime=api_stat.ctime,
+        atime=_ensure_utc(api_stat.atime),
+        mtime=_ensure_utc(api_stat.mtime),
+        ctime=_ensure_utc(api_stat.ctime),
         target=target,
     )
 
@@ -32,6 +40,10 @@ class DualMethod:
     When accessed on the class (e.g. ``Volume.get_info``), the static function
     is returned.  When accessed on an instance (e.g. ``vol.get_info``), the
     instance method is returned as a bound method.
+
+    ``static_fn`` may be a ``classmethod``, in which case it is bound to the
+    accessed class so it can read class-level state (e.g. the API params an
+    :class:`e2b.E2B` client bound to a generated subclass).
     """
 
     def __init__(self, static_fn, instance_fn):
@@ -40,5 +52,5 @@ class DualMethod:
 
     def __get__(self, obj, objtype=None):
         if obj is None:
-            return self._static_fn
+            return self._static_fn.__get__(None, objtype)
         return self._instance_fn.__get__(obj, objtype)

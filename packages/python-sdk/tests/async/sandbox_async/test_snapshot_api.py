@@ -1,5 +1,7 @@
 import pytest
-from e2b import AsyncSandbox
+from e2b import AsyncSandbox, SandboxException
+
+pytestmark = pytest.mark.timeout(120)
 
 
 @pytest.mark.skip_debug()
@@ -97,6 +99,31 @@ async def test_list_snapshots_for_sandbox(async_sandbox: AsyncSandbox):
 
 
 @pytest.mark.skip_debug()
+async def test_list_snapshots_filtered_by_name(
+    async_sandbox: AsyncSandbox, sandbox_test_id: str
+):
+    snapshot_name = f"snap-filter-{sandbox_test_id}"
+
+    snapshot = await async_sandbox.create_snapshot(name=snapshot_name)
+
+    try:
+        paginator = AsyncSandbox.list_snapshots(name=snapshot_name)
+        snapshots = await paginator.next_items()
+
+        found = any(s.snapshot_id == snapshot.snapshot_id for s in snapshots)
+        assert found
+
+        empty_paginator = AsyncSandbox.list_snapshots(
+            name=f"{snapshot_name}-does-not-exist"
+        )
+        empty_snapshots = await empty_paginator.next_items()
+        assert isinstance(empty_snapshots, list)
+        assert len(empty_snapshots) == 0
+    finally:
+        await AsyncSandbox.delete_snapshot(snapshot.snapshot_id)
+
+
+@pytest.mark.skip_debug()
 async def test_create_named_snapshot(async_sandbox: AsyncSandbox, sandbox_test_id: str):
     snapshot_name = f"snap-{sandbox_test_id}"
 
@@ -123,6 +150,7 @@ async def test_delete_snapshot(async_sandbox: AsyncSandbox):
 
 
 @pytest.mark.skip_debug()
+@pytest.mark.timeout(180)
 async def test_snapshot_preserves_filesystem(async_sandbox: AsyncSandbox):
     app_dir = "/home/user/app"
     config_path = f"{app_dir}/config.json"
@@ -137,7 +165,14 @@ async def test_snapshot_preserves_filesystem(async_sandbox: AsyncSandbox):
     snapshot = await async_sandbox.create_snapshot()
 
     try:
-        new_sandbox = await AsyncSandbox.create(snapshot.snapshot_id)
+        try:
+            new_sandbox = await AsyncSandbox.create(snapshot.snapshot_id)
+        except SandboxException as error:
+            # Placement can transiently time out while the snapshot is restored.
+            # Retry only the backend response that explicitly asks the caller to do so.
+            if "Failed to place sandbox: placement timed out" not in str(error):
+                raise
+            new_sandbox = await AsyncSandbox.create(snapshot.snapshot_id)
 
         try:
             dir_exists = await new_sandbox.files.exists(app_dir)

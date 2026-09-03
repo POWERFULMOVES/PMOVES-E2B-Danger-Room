@@ -1,5 +1,6 @@
-deno 1.46.3
-nodejs 20.19.5
-pnpm 9.15.5
+bun 1.3.14
+deno 2.8.1
+nodejs 22.18.0
+pnpm 10.34.5
 python 3.10
-poetry 2.1.1
+uv 0.10.0

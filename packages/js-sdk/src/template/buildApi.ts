@@ -1,10 +1,13 @@
-import { ApiClient, handleApiError, paths, components } from '../api'
+import fs from 'node:fs'
+import stream from 'node:stream'
+
+import { ApiClient, handleApiError, components } from '../api'
 import { buildRequestSignal } from '../connectionConfig'
-import { dynamicImport, stripAnsi } from '../utils'
+import { loadUndici } from '../undici'
 import { BuildError, FileUploadError, TemplateError } from '../errors'
 import { FILE_UPLOAD_TIMEOUT_MS } from './consts'
 import { LogEntry } from './logger'
-import { getBuildStepIndex, tarFileStreamUpload } from './utils'
+import { getBuildStepIndex, spoolTarArchive } from './utils'
 import {
   BuildStatusReason,
   TemplateBuildStatus,
@@ -41,11 +44,9 @@ type CheckAliasExistsInput = {
   alias: string
 }
 
-type ApiBuildStatusResponse =
-  paths['/templates/{templateID}/builds/{buildID}/status']['get']['responses']['200']['content']['application/json']
+type ApiBuildStatusResponse = components['schemas']['TemplateBuildInfo']
 
-export type TriggerBuildTemplate =
-  paths['/v2/templates/{templateID}/builds/{buildID}']['post']['requestBody']['content']['application/json']
+export type TriggerBuildTemplate = components['schemas']['TemplateBuildStartV2']
 
 export async function requestBuild(
   client: ApiClient,
@@ -112,6 +113,7 @@ export async function uploadFile(
     url: string
     ignorePatterns: string[]
     resolveSymlinks: boolean
+    gzip: boolean
   },
   stackTrace: string | undefined,
   // Uploads (PUT to S3 presigned URL) can take a long time for large
@@ -121,40 +123,36 @@ export async function uploadFile(
   // via `signal`) to override.
   abortOpts?: { signal?: AbortSignal; requestTimeoutMs?: number }
 ) {
-  const { fileName, url, fileContextPath, ignorePatterns, resolveSymlinks } =
-    options
+  const {
+    fileName,
+    url,
+    fileContextPath,
+    ignorePatterns,
+    resolveSymlinks,
+    gzip,
+  } = options
+  // Spool the archive to a temporary file and stream it from disk instead of
+  // buffering it in memory. S3 presigned PUT URLs reject Transfer-Encoding:
+  // chunked with 501 NotImplemented (see e2b-dev/e2b#1243), so the upload
+  // must carry an exact Content-Length. The Python SDK takes the same
+  // approach (build_api.py:upload_file).
+  let cleanup: (() => Promise<void>) | undefined
   try {
-    const uploadStream = await tarFileStreamUpload(
+    const tar = await spoolTarArchive(
       fileName,
       fileContextPath,
       ignorePatterns,
-      resolveSymlinks
+      resolveSymlinks,
+      gzip
+    )
+    cleanup = tar.cleanup
+
+    const signal = buildRequestSignal(
+      abortOpts?.requestTimeoutMs ?? FILE_UPLOAD_TIMEOUT_MS,
+      abortOpts?.signal
     )
 
-    // Buffer the archive before uploading so fetch sets Content-Length.
-    // S3 presigned PUT URLs reject Transfer-Encoding: chunked with 501
-    // NotImplemented, which is what Node's fetch falls back to when the
-    // body is a Readable without a known length. See e2b-dev/e2b#1243.
-    // The Python SDK takes the same approach (build_api.py:upload_file).
-    // Dynamically import so the browser bundle doesn't pull in node:stream.
-    // tar's Pack extends Minipass and is iterable as AsyncIterable<Buffer> at
-    // runtime, but the cli's tsconfig (preserveSymlinks) doesn't surface that
-    // through the type chain — cast via unknown.
-    const { buffer } = await dynamicImport<
-      typeof import('node:stream/consumers')
-    >('node:stream/consumers')
-    const uploadBody = await buffer(
-      uploadStream as unknown as AsyncIterable<Buffer>
-    )
-
-    const res = await fetch(url, {
-      method: 'PUT',
-      body: uploadBody,
-      signal: buildRequestSignal(
-        abortOpts?.requestTimeoutMs ?? FILE_UPLOAD_TIMEOUT_MS,
-        abortOpts?.signal
-      ),
-    })
+    const res = await putFileStream(url, tar.path, tar.size, signal)
 
     if (!res.ok) {
       throw new FileUploadError(
@@ -167,7 +165,38 @@ export async function uploadFile(
       throw error
     }
     throw new FileUploadError(`Failed to upload file: ${error}`, stackTrace)
+  } finally {
+    await cleanup?.()
   }
+}
+
+async function putFileStream(
+  url: string,
+  filePath: string,
+  size: number,
+  signal: AbortSignal | undefined
+): Promise<{ ok: boolean; statusText: string }> {
+  // Prefer undici's fetch: it honors the explicit Content-Length on stream
+  // bodies on every runtime, while Deno's native fetch ignores the header and
+  // falls back to chunked. Where undici isn't resolvable (e.g. bundled apps),
+  // fall back to the global fetch — Node's and Bun's native fetch also honor
+  // Content-Length on stream bodies. loadUndici tries undici 8 first and
+  // falls back to undici 7 where 8 doesn't import (Bun).
+  const undici = await loadUndici()
+  const fetchImpl = (undici?.fetch as typeof fetch | undefined) ?? fetch
+
+  return await fetchImpl(url, {
+    method: 'PUT',
+    body: stream.Readable.toWeb(
+      fs.createReadStream(filePath)
+    ) as ReadableStream,
+    headers: {
+      'Content-Length': size.toString(),
+    },
+    // Streaming request bodies require half-duplex mode.
+    duplex: 'half',
+    signal,
+  } as RequestInit)
 }
 
 export async function triggerBuild(
@@ -311,9 +340,7 @@ export async function waitForBuildFinish(
   let logsOffset = 0
   let status: TemplateBuildStatus = 'building'
 
-  while (status === 'building' || status === 'waiting') {
-    signal?.throwIfAborted()
-
+  const pollStatus = async (): Promise<TemplateBuildStatusResponse> => {
     const buildStatus = await getBuildStatus(
       client,
       {
@@ -325,26 +352,33 @@ export async function waitForBuildFinish(
     )
 
     logsOffset += buildStatus.logEntries.length
+    buildStatus.logEntries.forEach((logEntry) => onBuildLogs?.(logEntry))
 
-    buildStatus.logEntries.forEach((logEntry) =>
-      onBuildLogs?.(
-        new LogEntry(
-          logEntry.timestamp,
-          logEntry.level,
-          stripAnsi(logEntry.message)
-        )
-      )
-    )
+    return buildStatus
+  }
+
+  while (status === 'building' || status === 'waiting') {
+    signal?.throwIfAborted()
+
+    const buildStatus = await pollStatus()
 
     status = buildStatus.status
     switch (status) {
-      case 'ready': {
-        return
-      }
-      case 'waiting': {
-        break
-      }
+      case 'ready':
       case 'error': {
+        // The status endpoint returns at most 100 log entries per call, so
+        // the terminal response may not include the last logs — keep
+        // fetching until they are drained.
+        let tailStatus = buildStatus
+        while (tailStatus.logEntries.length > 0) {
+          signal?.throwIfAborted()
+          tailStatus = await pollStatus()
+        }
+
+        if (status === 'ready') {
+          return
+        }
+
         let stackError: string | undefined
         if (buildStatus.reason?.step !== undefined) {
           const step = getBuildStepIndex(
@@ -358,6 +392,9 @@ export async function waitForBuildFinish(
           buildStatus?.reason?.message ?? 'Unknown error',
           stackError
         )
+      }
+      case 'waiting': {
+        break
       }
     }
 

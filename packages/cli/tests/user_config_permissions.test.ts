@@ -19,11 +19,23 @@ describe('writeUserConfig', () => {
     tmpDirs.push(tmpDir)
     const configPath = path.join(tmpDir, '.e2b', 'config.json')
     const config: UserConfig = {
-      email: 'victim@example.com',
-      accessToken: 'access-token-secret',
-      teamName: 'default',
-      teamId: 'team-id',
-      teamApiKey: 'team-api-key-secret',
+      version: 2,
+      identity: {
+        email: 'victim@example.com',
+      },
+      oauth: {
+        token_endpoint: 'https://hydra.example.com/oauth2/token',
+        revoke_endpoint: 'https://hydra.example.com/oauth2/revoke',
+        client_id: 'cli-client-id',
+      },
+      tokens: {
+        access_token: 'access-token-secret',
+        refresh_token: 'refresh-token-secret',
+      },
+      last_refresh: '2024-06-24T12:00:00.000Z',
+      projectName: 'default',
+      projectId: 'project-id',
+      projectApiKey: 'project-api-key-secret',
     }
 
     writeUserConfig(configPath, config)

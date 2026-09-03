@@ -7,6 +7,7 @@ import * as commander from 'commander'
 
 import { ensureAPIKey } from '../../api'
 import { setupSignalHandlers } from 'src/utils/signal'
+import { parseEnv } from 'src/utils/env'
 import { buildCommand, isPipedStdin, streamStdinChunks } from './exec_helpers'
 
 interface ExecOptions {
@@ -19,21 +20,22 @@ interface ExecOptions {
 const NO_COMMAND_TIMEOUT = 0
 export const execCommand = new commander.Command('exec')
   .description('execute a command in a running sandbox')
+  .addHelpText(
+    'after',
+    '\nEverything after the sandbox ID is passed through to the remote command,\n' +
+      'so e2b options must come before the sandbox ID:\n' +
+      '  e2b sandbox exec -u root <sandboxID> codex exec "prompt" --help'
+  )
   .argument('<sandboxID>', 'sandbox ID to execute command in')
   .argument('<command...>', 'command to execute')
+  .passThroughOptions()
   .option('-b, --background', 'run in background and return immediately')
   .option('-c, --cwd <dir>', 'working directory')
   .option('-u, --user <user>', 'run as specified user')
   .option(
     '-e, --env <KEY=VALUE>',
     'set environment variable (repeatable)',
-    (value: string, previous: Record<string, string>) => {
-      const [key, ...rest] = value.split('=')
-      if (key && rest.length > 0) {
-        previous[key] = rest.join('=')
-      }
-      return previous
-    },
+    parseEnv,
     {} as Record<string, string>
   )
   .alias('ex')
@@ -41,7 +43,16 @@ export const execCommand = new commander.Command('exec')
     async (sandboxID: string, commandParts: string[], opts: ExecOptions) => {
       const hasPipedStdin = isPipedStdin()
 
-      const command = buildCommand(commandParts)
+      let command: string
+      try {
+        command = buildCommand(commandParts)
+      } catch (err) {
+        if (err instanceof commander.InvalidArgumentError) {
+          execCommand.error(`error: ${err.message}`)
+        }
+        throw err
+      }
+
       try {
         const apiKey = ensureAPIKey()
         const sandbox = await Sandbox.connect(sandboxID, { apiKey })

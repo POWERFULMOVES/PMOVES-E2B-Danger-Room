@@ -2,7 +2,11 @@ export { ApiClient } from './api'
 export type { components, paths } from './api'
 
 export { ConnectionConfig } from './connectionConfig'
-export type { ConnectionOpts, Username } from './connectionConfig'
+export type {
+  ConnectionConfigOpts,
+  ConnectionOpts,
+  Username,
+} from './connectionConfig'
 export {
   AuthenticationError,
   FileNotFoundError,
@@ -19,6 +23,10 @@ export {
   BuildError,
   FileUploadError,
   VolumeError,
+  VolumeNotFoundError,
+  VolumePathNotFoundError,
+  SecretError,
+  SecretNotFoundError,
 } from './errors'
 export type { Logger } from './logs'
 
@@ -52,10 +60,18 @@ export type {
   SandboxOpts,
   SandboxApiOpts,
   SandboxConnectOpts,
+  SandboxForkOpts,
   SandboxMetricsOpts,
+  SandboxPauseOpts,
   SandboxState,
   SandboxListOpts,
+  SandboxListOrder,
   SandboxPaginator,
+  SandboxIamOpts,
+  SandboxIamToken,
+  SandboxIamTokenType,
+  SandboxEgressProxyOpts,
+  SandboxEgressProxyInfo,
   SandboxNetworkOpts,
   SandboxNetworkInfo,
   SandboxNetworkSelector,
@@ -64,7 +80,10 @@ export type {
   SandboxNetworkRuleInfo,
   SandboxNetworkRules,
   SandboxNetworkTransform,
+  SandboxNetworkTransformContext,
+  SandboxNetworkTransformResolver,
   SandboxNetworkUpdate,
+  SandboxOnTimeout,
   SandboxLifecycle,
   SandboxInfoLifecycle,
   SnapshotInfo,
@@ -74,6 +93,17 @@ export type {
 } from './sandbox/sandboxApi'
 
 export type { McpServer } from './sandbox/mcp'
+
+export { Secret, SecretPaginator } from './secret'
+export type {
+  SecretInfo,
+  SecretCreateOpts,
+  SecretUpdateOpts,
+  SecretGetInfoOpts,
+  SecretExistsOpts,
+  SecretDestroyOpts,
+  SecretListOpts,
+} from './secret'
 
 export { ALL_TRAFFIC } from './sandbox/network'
 
@@ -94,6 +124,9 @@ export type {
   GitRemoteAddOpts,
   GitCommitOpts,
   GitAddOpts,
+  GitResetMode,
+  GitResetOpts,
+  GitRestoreOpts,
   GitDeleteBranchOpts,
   GitPushOpts,
   GitPullOpts,
@@ -103,6 +136,7 @@ export type {
   GitBranches,
   GitFileStatus,
   GitStatus,
+  GitStatusLabel,
 } from './sandbox/git'
 
 export { Volume, VolumeFileType } from './volume'
@@ -110,14 +144,20 @@ export type {
   VolumeInfo,
   VolumeAndToken,
   VolumeEntryStat,
-  VolumeMetadataOptions,
-  VolumeWriteOptions,
+  VolumeMetadataOpts,
+  VolumeReadOpts,
+  VolumeWriteOpts,
   VolumeApiOpts,
   VolumeConnectionConfig,
+  // Deprecated aliases, kept for backwards compatibility.
+  VolumeMetadataOptions,
+  VolumeWriteOptions,
 } from './volume'
 
 export { Sandbox }
 import { Sandbox } from './sandbox'
+
+export { E2B, type E2BClientOpts } from './client'
 
 export default Sandbox
 

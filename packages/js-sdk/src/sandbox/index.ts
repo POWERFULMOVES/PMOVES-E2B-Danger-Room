@@ -11,11 +11,13 @@ import { EnvdApiClient, handleEnvdApiError } from '../envd/api'
 import { createEnvdFetch, createEnvdRpcFetch } from '../envd/http2'
 import { createRpcLogger } from '../logs'
 import { Commands, Pty } from './commands'
+import { CommandExitError } from './commands/commandHandle'
 import { Filesystem } from './filesystem'
 import { Git } from './git'
 import {
   SandboxOpts,
   SandboxConnectOpts,
+  SandboxForkOpts,
   SandboxMetricsOpts,
   SandboxApi,
   SandboxListOpts,
@@ -25,10 +27,11 @@ import {
   SnapshotInfo,
   SnapshotPaginator,
   CreateSnapshotOpts,
+  SandboxPauseOpts,
 } from './sandboxApi'
 import { getSignature } from './signature'
 import { compareVersions } from 'compare-versions'
-import { SandboxError } from '../errors'
+import { InvalidArgumentError, SandboxError, TemplateError } from '../errors'
 import { ENVD_DEBUG_FALLBACK, ENVD_DEFAULT_USER } from '../envd/versions'
 import { shellQuote } from '../utils'
 
@@ -55,7 +58,6 @@ export interface SandboxUrlOpts {
  * - Access Linux OS
  * - Create, list, and delete files and directories
  * - Run commands
- * - Run git operations
  * - Run isolated code
  * - Access the internet
  *
@@ -89,6 +91,8 @@ export class Sandbox extends SandboxApi {
   readonly pty: Pty
   /**
    * Module for running git operations in the sandbox
+   *
+   * @deprecated Run git with `sandbox.commands.run()` instead. The git module will be removed in the next major version.
    */
   readonly git: Git
 
@@ -159,8 +163,8 @@ export class Sandbox extends SandboxApi {
       'E2b-Sandbox-Id': this.sandboxId,
       'E2b-Sandbox-Port': this.envdPort.toString(),
     }
-    const envdFetch = createEnvdFetch()
-    const envdRpcFetch = createEnvdRpcFetch()
+    const envdFetch = createEnvdFetch(this.connectionConfig.proxy)
+    const envdRpcFetch = createEnvdRpcFetch(this.connectionConfig.proxy)
 
     const rpcTransport = createConnectTransport({
       baseUrl: this.envdApiUrl,
@@ -200,13 +204,10 @@ export class Sandbox extends SandboxApi {
       {
         apiUrl: this.envdApiUrl,
         logger: opts?.logger,
-        accessToken: this.envdAccessToken,
+        envdAccessToken: this.envdAccessToken,
         headers: {
           'User-Agent': this.connectionConfig.headers?.['User-Agent'] ?? '',
           ...sandboxHeaders,
-          ...(this.envdAccessToken
-            ? { 'X-Access-Token': this.envdAccessToken }
-            : {}),
         },
         fetch: (request) => envdFetch(request),
       },
@@ -219,24 +220,33 @@ export class Sandbox extends SandboxApi {
       this.envdApi,
       this.connectionConfig
     )
-    this.commands = new Commands(rpcTransport, this.connectionConfig, {
-      version: opts.envdVersion,
-    })
-    this.pty = new Pty(rpcTransport, this.connectionConfig, {
-      version: opts.envdVersion,
-    })
+    this.commands = new Commands(
+      rpcTransport,
+      this.envdApi,
+      this.connectionConfig
+    )
+    this.pty = new Pty(rpcTransport, this.envdApi, this.connectionConfig)
     this.git = new Git(this.commands)
   }
 
   /**
-   * List all sandboxes.
+   * List sandboxes.
    *
-   * @param opts connection options.
+   * By default (no `query.state` set in `opts`), returns sandboxes in both
+   * `running` and `paused` states. To filter by state, pass
+   * `opts.query.state = [...]`.
    *
-   * @returns paginator for listing sandboxes.
+   * @param opts connection options, plus optional `query` to filter by
+   *   metadata / state / start time / template, `order` to sort by start
+   *   time across the whole result set (not within a page), and `limit` /
+   *   `nextToken` for pagination.
+   *
+   * @returns a {@link SandboxPaginator} that yields pages of sandboxes
+   *   (running and paused by default). Iterate pages via
+   *   `await paginator.nextItems()` while `paginator.hasNext` is `true`.
    */
   static list(opts?: SandboxListOpts): SandboxPaginator {
-    return new SandboxPaginator(opts)
+    return new SandboxPaginator(this.resolveOpts(opts))
   }
 
   /**
@@ -296,7 +306,8 @@ export class Sandbox extends SandboxApi {
             sandboxOpts: templateOrOpts,
           }
 
-    const config = new ConnectionConfig(sandboxOpts)
+    const apiOpts = this.resolveOpts(sandboxOpts)
+    const config = new ConnectionConfig(apiOpts)
     if (config.debug) {
       return new this({
         sandboxId: 'debug_sandbox_id',
@@ -305,27 +316,32 @@ export class Sandbox extends SandboxApi {
       }) as InstanceType<S>
     }
 
-    const sandboxInfo = await SandboxApi.createSandbox(
+    const sandboxInfo = await this.createSandbox(
       template,
-      sandboxOpts?.timeoutMs ?? this.defaultSandboxTimeoutMs,
-      sandboxOpts
+      apiOpts?.timeoutMs ?? this.defaultSandboxTimeoutMs,
+      apiOpts
     )
 
     const sandbox = new this({ ...sandboxInfo, ...config }) as InstanceType<S>
 
     if (sandboxOpts?.mcp) {
       sandbox.mcpToken = crypto.randomUUID()
-      const res = await sandbox.commands.run(
-        `mcp-gateway --config ${shellQuote(JSON.stringify(sandboxOpts.mcp))}`,
-        {
-          user: 'root',
-          envs: {
-            GATEWAY_ACCESS_TOKEN: sandbox.mcpToken ?? '',
-          },
+      try {
+        await sandbox.commands.run(
+          `mcp-gateway --config ${shellQuote(JSON.stringify(sandboxOpts.mcp))}`,
+          {
+            user: 'root',
+            envs: {
+              GATEWAY_ACCESS_TOKEN: sandbox.mcpToken ?? '',
+            },
+          }
+        )
+      } catch (error) {
+        await sandbox.kill().catch(() => undefined)
+        if (error instanceof CommandExitError) {
+          throw new SandboxError(`Failed to start MCP gateway: ${error.stderr}`)
         }
-      )
-      if (res.exitCode !== 0) {
-        throw new Error(`Failed to start MCP gateway: ${res.stderr}`)
+        throw error
       }
     }
 
@@ -357,8 +373,17 @@ export class Sandbox extends SandboxApi {
     sandboxId: string,
     opts?: SandboxConnectOpts
   ): Promise<InstanceType<S>> {
-    const sandbox = await SandboxApi.connectSandbox(sandboxId, opts)
-    const config = new ConnectionConfig(opts)
+    const apiOpts = this.resolveOpts(opts)
+    const config = new ConnectionConfig(apiOpts)
+    if (config.debug) {
+      return new this({
+        sandboxId,
+        envdVersion: ENVD_DEBUG_FALLBACK,
+        ...config,
+      }) as InstanceType<S>
+    }
+
+    const sandbox = await this.connectSandbox(sandboxId, apiOpts)
 
     return new this({
       sandboxId,
@@ -368,6 +393,57 @@ export class Sandbox extends SandboxApi {
       envdVersion: sandbox.envdVersion,
       ...config,
     }) as InstanceType<S>
+  }
+
+  /**
+   * Fork a running sandbox specified by sandbox ID.
+   *
+   * The sandbox is checkpointed in place (briefly paused, snapshotted with its
+   * full memory state, and resumed — its ID and expiration stay untouched) and
+   * `count` new sandboxes are created from that snapshot. All forks boot from
+   * the same snapshot, so the snapshot is captured once regardless of count.
+   *
+   * Each fork succeeds or fails independently — the returned array contains
+   * one entry per requested fork, either a running {@link Sandbox} instance or
+   * an `Error` describing why that fork failed to start
+   * (`Promise.allSettled`-style). Per-fork error codes map to the same error
+   * classes as other API errors (e.g. 429 to `RateLimitError`).
+   *
+   * @param sandboxId sandbox ID.
+   * @param opts fork options — `count`, `timeoutMs` and connection options.
+   *
+   * @returns array with one entry per requested fork — a sandbox instance or an error.
+   *
+   * @example
+   * ```ts
+   * const sandbox = await Sandbox.create()
+   *
+   * const [fork1, fork2] = await Sandbox.fork(sandbox.sandboxId, { count: 2 })
+   * if (fork1 instanceof Sandbox) {
+   *   await fork1.commands.run('echo "hello from fork"')
+   * }
+   * ```
+   */
+  static async fork<S extends typeof Sandbox>(
+    this: S,
+    sandboxId: string,
+    opts?: SandboxForkOpts
+  ): Promise<Array<InstanceType<S> | Error>> {
+    const apiOpts = this.resolveOpts(opts)
+    const config = new ConnectionConfig(apiOpts)
+
+    const results = await this.forkSandbox(
+      sandboxId,
+      apiOpts?.timeoutMs ?? this.defaultSandboxTimeoutMs,
+      apiOpts?.count ?? 1,
+      apiOpts
+    )
+
+    return results.map((result) =>
+      result instanceof Error
+        ? result
+        : (new this({ ...result, ...config }) as InstanceType<S>)
+    )
   }
 
   /**
@@ -390,9 +466,49 @@ export class Sandbox extends SandboxApi {
    * ```
    */
   async connect(opts?: SandboxConnectOpts): Promise<this> {
+    if (this.connectionConfig.debug) {
+      // Skip connecting to the sandbox in debug mode
+      return this
+    }
+
     await SandboxApi.connectSandbox(this.sandboxId, this.resolveApiOpts(opts))
 
     return this
+  }
+
+  /**
+   * Fork the sandbox.
+   *
+   * The sandbox is checkpointed in place (briefly paused, snapshotted with its
+   * full memory state, and resumed — its ID and expiration stay untouched) and
+   * `count` new sandboxes are created from that snapshot. All forks boot from
+   * the same snapshot, so the snapshot is captured once regardless of count.
+   *
+   * Each fork succeeds or fails independently — the returned array contains
+   * one entry per requested fork, either a running {@link Sandbox} instance or
+   * an `Error` describing why that fork failed to start
+   * (`Promise.allSettled`-style). Per-fork error codes map to the same error
+   * classes as other API errors (e.g. 429 to `RateLimitError`).
+   *
+   * @param opts fork options — `count`, `timeoutMs` and connection options.
+   *
+   * @returns array with one entry per requested fork — a sandbox instance or an error.
+   *
+   * @example
+   * ```ts
+   * const sandbox = await Sandbox.create()
+   *
+   * const [fork1, fork2] = await sandbox.fork({ count: 2 })
+   * if (fork1 instanceof Sandbox) {
+   *   await fork1.commands.run('echo "hello from fork"')
+   * }
+   * ```
+   */
+  async fork(opts?: SandboxForkOpts): Promise<Array<this | Error>> {
+    const cls = this.constructor as typeof Sandbox
+    return (await cls.fork(this.sandboxId, this.resolveApiOpts(opts))) as Array<
+      this | Error
+    >
   }
 
   /**
@@ -407,7 +523,7 @@ export class Sandbox extends SandboxApi {
    * ```ts
    * const sandbox = await Sandbox.create()
    * // Start an HTTP server
-   * await sandbox.commands.exec('python3 -m http.server 3000')
+   * await sandbox.commands.run('python3 -m http.server 3000', { background: true })
    * // Get the hostname of the HTTP server
    * const serverURL = sandbox.getHost(3000)
    * ```
@@ -507,37 +623,48 @@ export class Sandbox extends SandboxApi {
    * Kill the sandbox.
    *
    * @param opts connection options.
+   *
+   * @returns `true` if the sandbox was killed, `false` if the sandbox was not found.
    */
-  async kill(opts?: Pick<SandboxOpts, 'requestTimeoutMs' | 'signal'>) {
+  async kill(
+    opts?: Pick<SandboxOpts, 'requestTimeoutMs' | 'signal'>
+  ): Promise<boolean> {
     if (this.connectionConfig.debug) {
-      // Skip killing in debug mode
-      return
+      // Skip killing the sandbox in debug mode
+      return true
     }
 
-    await SandboxApi.kill(this.sandboxId, this.resolveApiOpts(opts))
+    return await SandboxApi.kill(this.sandboxId, this.resolveApiOpts(opts))
   }
 
   /**
    * Pause a sandbox by its ID.
    *
-   * @param opts connection options.
+   * @param opts connection options, plus `keepMemory` to control the snapshot
+   * kind. When `opts.keepMemory` is `false`, the in-memory state is dropped and
+   * only the filesystem is persisted (a filesystem-only snapshot); resuming such
+   * a sandbox cold-boots (reboots) it from disk, losing running processes and
+   * open connections. Defaults to `true` (full memory snapshot).
    *
-   * @returns sandbox ID that can be used to resume the sandbox.
+   * @returns `true` if the sandbox got paused, `false` if the sandbox was already paused.
    *
    * @example
    * ```ts
    * const sandbox = await Sandbox.create()
    * await sandbox.pause()
+   *
+   * // filesystem-only snapshot (resume reboots the sandbox)
+   * await sandbox.pause({ keepMemory: false })
    * ```
    */
-  async pause(opts?: ConnectionOpts): Promise<boolean> {
+  async pause(opts?: SandboxPauseOpts): Promise<boolean> {
     return await SandboxApi.pause(this.sandboxId, this.resolveApiOpts(opts))
   }
 
   /**
    * @deprecated Use {@link Sandbox.pause} instead.
    */
-  async betaPause(opts?: ConnectionOpts): Promise<boolean> {
+  async betaPause(opts?: SandboxPauseOpts): Promise<boolean> {
     return await SandboxApi.betaPause(this.sandboxId, this.resolveApiOpts(opts))
   }
 
@@ -629,7 +756,7 @@ export class Sandbox extends SandboxApi {
     const useSignature = !!this.envdAccessToken
 
     if (!useSignature && opts.useSignatureExpiration != undefined) {
-      throw new Error(
+      throw new InvalidArgumentError(
         'Signature expiration can be used only when sandbox is created as secured.'
       )
     }
@@ -681,7 +808,7 @@ export class Sandbox extends SandboxApi {
     const useSignature = !!this.envdAccessToken
 
     if (!useSignature && opts.useSignatureExpiration != undefined) {
-      throw new Error(
+      throw new InvalidArgumentError(
         'Signature expiration can be used only when sandbox is created as secured.'
       )
     }
@@ -736,11 +863,15 @@ export class Sandbox extends SandboxApi {
    * @returns  List of sandbox metrics containing CPU, memory and disk usage information.
    */
   async getMetrics(opts?: SandboxMetricsOpts) {
+    if (this.connectionConfig.debug) {
+      // Skip getting the metrics in debug mode
+      return []
+    }
+
     if (this.envdApi.version) {
       if (compareVersions(this.envdApi.version, '0.1.5') < 0) {
-        throw new SandboxError(
-          'You need to update the template to use the new SDK. ' +
-            'You can do this by running `e2b template build` in the directory with the template.'
+        throw new TemplateError(
+          'You need to update the template to use the new SDK.'
         )
       }
 
@@ -760,10 +891,10 @@ export class Sandbox extends SandboxApi {
   private resolveApiOpts<T extends ConnectionOpts>(
     opts?: T
   ): ConnectionOpts & T {
-    return {
-      ...this.connectionConfig,
-      ...(opts ?? {}),
-    } as ConnectionOpts & T
+    return ConnectionConfig.mergeOpts(
+      this.connectionConfig,
+      opts
+    ) as ConnectionOpts & T
   }
 
   private fileUrl(path: string | undefined, username: string | undefined) {

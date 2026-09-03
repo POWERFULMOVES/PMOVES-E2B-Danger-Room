@@ -1,6 +1,17 @@
-import { describe, expect } from 'vitest'
-import { NotFoundError, VolumeError, VolumeFileType } from '../../src'
+import { afterAll, beforeAll, beforeEach, describe, expect } from 'vitest'
+import { setupServer } from 'msw/node'
+
+import { VolumeError, VolumeFileType, VolumePathNotFoundError } from '../../src'
 import { volumeTest } from '../setup'
+import { createMockVolumeApi } from './mockVolumeContent'
+
+const server = setupServer()
+
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }))
+afterAll(() => server.close())
+// A fresh mock per test gives isolated state (same as the per-fixture
+// MockVolumeContentAPI in the Python SDK tests).
+beforeEach(() => server.resetHandlers(...createMockVolumeApi()))
 
 describe('Volume File Operations', () => {
   describe('writeFile and readFile', () => {
@@ -58,6 +69,20 @@ describe('Volume File Operations', () => {
       }
     )
 
+    volumeTest(
+      'should write and read a file from a ReadableStream',
+      async ({ volume }) => {
+        const path = '/test-stream.txt'
+        const content = 'Test stream content'
+        const stream = new Blob([content]).stream()
+
+        await volume.writeFile(path, stream)
+        const readContent = await volume.readFile(path, { format: 'text' })
+
+        expect(readContent).toBe(content)
+      }
+    )
+
     volumeTest('should write and read an empty file', async ({ volume }) => {
       const path = '/empty.txt'
       const content = ''
@@ -67,6 +92,30 @@ describe('Volume File Operations', () => {
 
       expect(readContent).toBe(content)
     })
+
+    volumeTest(
+      'should read an empty file in all formats',
+      async ({ volume }) => {
+        const path = '/empty-formats.txt'
+        await volume.writeFile(path, '')
+
+        const bytes = await volume.readFile(path, { format: 'bytes' })
+        expect(bytes).toBeInstanceOf(Uint8Array)
+        expect(bytes.length).toBe(0)
+
+        const blob = await volume.readFile(path, { format: 'blob' })
+        expect(blob).toBeInstanceOf(Blob)
+        expect(blob.size).toBe(0)
+
+        const stream = await volume.readFile(path, { format: 'stream' })
+        expect(stream).toBeInstanceOf(ReadableStream)
+        const chunks: Uint8Array[] = []
+        for await (const chunk of stream as unknown as AsyncIterable<Uint8Array>) {
+          chunks.push(chunk)
+        }
+        expect(chunks.reduce((n, c) => n + c.length, 0)).toBe(0)
+      }
+    )
 
     volumeTest(
       'should overwrite an existing file with force option',
@@ -183,11 +232,11 @@ describe('Volume File Operations', () => {
     })
 
     volumeTest(
-      'should throw NotFoundError when updating non-existent file',
+      'should throw VolumePathNotFoundError when updating non-existent file',
       async ({ volume }) => {
         await expect(
           volume.updateMetadata('/non-existent.txt', { mode: 0o644 })
-        ).rejects.toThrow(NotFoundError)
+        ).rejects.toThrow(VolumePathNotFoundError)
       }
     )
   })
@@ -279,10 +328,10 @@ describe('Volume File Operations', () => {
     })
 
     volumeTest(
-      'should throw NotFoundError for non-existent directory',
+      'should throw VolumePathNotFoundError for non-existent directory',
       async ({ volume }) => {
         await expect(volume.list('/non-existent')).rejects.toThrow(
-          NotFoundError
+          VolumePathNotFoundError
         )
       }
     )
@@ -318,10 +367,10 @@ describe('Volume File Operations', () => {
     })
 
     volumeTest(
-      'should throw NotFoundError when removing non-existent file',
+      'should throw VolumePathNotFoundError when removing non-existent file',
       async ({ volume }) => {
         await expect(volume.remove('/non-existent.txt')).rejects.toThrow(
-          NotFoundError
+          VolumePathNotFoundError
         )
       }
     )

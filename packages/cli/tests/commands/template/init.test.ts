@@ -1,6 +1,7 @@
 import { execSync } from 'child_process'
 import { existsSync } from 'fs'
 import * as fs from 'fs/promises'
+import * as os from 'os'
 import * as path from 'path'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { Language } from '../../../src/commands/template/generators'
@@ -11,7 +12,7 @@ describe('Template Init', () => {
 
   beforeEach(async () => {
     // Use Node.js built-in temp directory handling
-    testDir = await fs.mkdtemp('e2b-init-test-')
+    testDir = await fs.mkdtemp(path.join(os.tmpdir(), 'e2b-init-test-'))
   })
 
   afterEach(async () => {
@@ -58,14 +59,13 @@ describe('Template Init', () => {
     })
 
     test('should validate template name format', async () => {
+      // Matches the server-side rule in e2b-dev/infra (id.identifierRegex):
+      // only lowercase letters, numbers, dashes and underscores are allowed.
       const invalidNames = [
-        'My-Template', // uppercase
-        '-invalid-start', // starts with hyphen
-        'invalid-end-', // ends with hyphen
-        '_invalid-start', // starts with underscore
-        'invalid-end_', // ends with underscore
         'invalid space', // contains space
+        'invalid.dot', // contains a dot
         '', // empty
+        'a'.repeat(129), // exceeds the 128 character limit
       ]
 
       for (const invalidName of invalidNames) {

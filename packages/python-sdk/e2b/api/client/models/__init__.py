@@ -2,6 +2,7 @@
 
 from .admin_build_cancel_result import AdminBuildCancelResult
 from .admin_sandbox_kill_result import AdminSandboxKillResult
+from .admin_team_running_sandbox_counts import AdminTeamRunningSandboxCounts
 from .assign_template_tags_request import AssignTemplateTagsRequest
 from .assigned_template_tags import AssignedTemplateTags
 from .aws_registry import AWSRegistry
@@ -28,6 +29,7 @@ from .max_team_metric import MaxTeamMetric
 from .mcp_type_0 import McpType0
 from .new_access_token import NewAccessToken
 from .new_sandbox import NewSandbox
+from .new_secret import NewSecret
 from .new_team_api_key import NewTeamAPIKey
 from .new_volume import NewVolume
 from .node import Node
@@ -35,17 +37,17 @@ from .node_detail import NodeDetail
 from .node_metrics import NodeMetrics
 from .node_status import NodeStatus
 from .node_status_change import NodeStatusChange
-from .post_sandboxes_sandbox_id_refreshes_body import (
-    PostSandboxesSandboxIDRefreshesBody,
-)
-from .post_sandboxes_sandbox_id_snapshots_body import (
-    PostSandboxesSandboxIDSnapshotsBody,
-)
-from .post_sandboxes_sandbox_id_timeout_body import PostSandboxesSandboxIDTimeoutBody
+from .order_direction import OrderDirection
 from .resumed_sandbox import ResumedSandbox
 from .sandbox import Sandbox
 from .sandbox_auto_resume_config import SandboxAutoResumeConfig
 from .sandbox_detail import SandboxDetail
+from .sandbox_egress_proxy_config_type_0 import SandboxEgressProxyConfigType0
+from .sandbox_fork_request import SandboxForkRequest
+from .sandbox_fork_result import SandboxForkResult
+from .sandbox_iam import SandboxIam
+from .sandbox_iam_token import SandboxIamToken
+from .sandbox_iam_tokens import SandboxIamTokens
 from .sandbox_lifecycle import SandboxLifecycle
 from .sandbox_log import SandboxLog
 from .sandbox_log_entry import SandboxLogEntry
@@ -61,9 +63,16 @@ from .sandbox_network_transform_headers import SandboxNetworkTransformHeaders
 from .sandbox_network_update_config import SandboxNetworkUpdateConfig
 from .sandbox_network_update_config_rules import SandboxNetworkUpdateConfigRules
 from .sandbox_on_timeout import SandboxOnTimeout
+from .sandbox_pause_request import SandboxPauseRequest
+from .sandbox_refresh_request import SandboxRefreshRequest
+from .sandbox_snapshot_request import SandboxSnapshotRequest
 from .sandbox_state import SandboxState
+from .sandbox_timeout_request import SandboxTimeoutRequest
 from .sandbox_volume_mount import SandboxVolumeMount
 from .sandboxes_with_metrics import SandboxesWithMetrics
+from .secret import Secret
+from .secret_metadata import SecretMetadata
+from .secret_update import SecretUpdate
 from .snapshot_info import SnapshotInfo
 from .team import Team
 from .team_api_key import TeamAPIKey
@@ -95,6 +104,7 @@ from .volume_token import VolumeToken
 __all__ = (
     "AdminBuildCancelResult",
     "AdminSandboxKillResult",
+    "AdminTeamRunningSandboxCounts",
     "AssignedTemplateTags",
     "AssignTemplateTagsRequest",
     "AWSRegistry",
@@ -121,6 +131,7 @@ __all__ = (
     "McpType0",
     "NewAccessToken",
     "NewSandbox",
+    "NewSecret",
     "NewTeamAPIKey",
     "NewVolume",
     "Node",
@@ -128,14 +139,18 @@ __all__ = (
     "NodeMetrics",
     "NodeStatus",
     "NodeStatusChange",
-    "PostSandboxesSandboxIDRefreshesBody",
-    "PostSandboxesSandboxIDSnapshotsBody",
-    "PostSandboxesSandboxIDTimeoutBody",
+    "OrderDirection",
     "ResumedSandbox",
     "Sandbox",
     "SandboxAutoResumeConfig",
     "SandboxDetail",
+    "SandboxEgressProxyConfigType0",
     "SandboxesWithMetrics",
+    "SandboxForkRequest",
+    "SandboxForkResult",
+    "SandboxIam",
+    "SandboxIamToken",
+    "SandboxIamTokens",
     "SandboxLifecycle",
     "SandboxLog",
     "SandboxLogEntry",
@@ -151,8 +166,15 @@ __all__ = (
     "SandboxNetworkUpdateConfig",
     "SandboxNetworkUpdateConfigRules",
     "SandboxOnTimeout",
+    "SandboxPauseRequest",
+    "SandboxRefreshRequest",
+    "SandboxSnapshotRequest",
     "SandboxState",
+    "SandboxTimeoutRequest",
     "SandboxVolumeMount",
+    "Secret",
+    "SecretMetadata",
+    "SecretUpdate",
     "SnapshotInfo",
     "Team",
     "TeamAPIKey",

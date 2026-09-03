@@ -38,6 +38,10 @@ def _parse_response(
         response_201 = Sandbox.from_dict(response.json())
 
         return response_201
+    if response.status_code == 400:
+        response_400 = Error.from_dict(response.json())
+
+        return response_400
     if response.status_code == 401:
         response_401 = Error.from_dict(response.json())
 
@@ -54,6 +58,14 @@ def _parse_response(
         response_500 = Error.from_dict(response.json())
 
         return response_500
+    if response.status_code == 503:
+        response_503 = Error.from_dict(response.json())
+
+        return response_503
+    if response.status_code == 504:
+        response_504 = Error.from_dict(response.json())
+
+        return response_504
     if client.raise_on_unexpected_status:
         raise errors.UnexpectedStatus(response.status_code, response.content)
     else:
@@ -77,7 +89,9 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: ResumedSandbox,
 ) -> Response[Union[Error, Sandbox]]:
-    """Resume the sandbox
+    """Resume sandbox
+
+     Resume the sandbox
 
     Args:
         sandbox_id (str):
@@ -109,7 +123,9 @@ def sync(
     client: AuthenticatedClient,
     body: ResumedSandbox,
 ) -> Optional[Union[Error, Sandbox]]:
-    """Resume the sandbox
+    """Resume sandbox
+
+     Resume the sandbox
 
     Args:
         sandbox_id (str):
@@ -136,7 +152,9 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: ResumedSandbox,
 ) -> Response[Union[Error, Sandbox]]:
-    """Resume the sandbox
+    """Resume sandbox
+
+     Resume the sandbox
 
     Args:
         sandbox_id (str):
@@ -166,7 +184,9 @@ async def asyncio(
     client: AuthenticatedClient,
     body: ResumedSandbox,
 ) -> Optional[Union[Error, Sandbox]]:
-    """Resume the sandbox
+    """Resume sandbox
+
+     Resume the sandbox
 
     Args:
         sandbox_id (str):

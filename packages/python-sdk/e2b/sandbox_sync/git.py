@@ -2,6 +2,7 @@ from typing import Dict, List, Optional
 
 from e2b.sandbox._git import (
     GitBranches,
+    GitResetMode,
     GitStatus,
     build_add_args,
     build_auth_error_message,
@@ -48,6 +49,8 @@ DEFAULT_GIT_ENV = {"GIT_TERMINAL_PROMPT": "0"}
 class Git:
     """
     Module for running git operations in the sandbox.
+
+    :deprecated: Run git with `sandbox.commands.run()` instead. The git module will be removed in the next major version.
     """
 
     def __init__(self, commands: Commands) -> None:
@@ -647,7 +650,7 @@ class Git:
     def reset(
         self,
         path: str,
-        mode: Optional[str] = None,
+        mode: Optional[GitResetMode] = None,
         target: Optional[str] = None,
         paths: Optional[List[str]] = None,
         envs: Optional[Dict[str, str]] = None,

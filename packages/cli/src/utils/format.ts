@@ -9,12 +9,12 @@ import { UserConfig } from '../user'
 export const primaryColor = '#FFB766'
 
 export function asFormattedConfig(config: UserConfig) {
-  const email = asBold(config.email)
-  const team = config.teamName
-    ? asBold(config.teamName)
-    : asRed('Log out and log in to get team name')
-  const teamId = asBold(config.teamId)
-  return `You are logged in as ${email},\nSelected team: ${team} (${teamId})`
+  const email = asBold(config.identity.email)
+  const project = config.projectName
+    ? asBold(config.projectName)
+    : asRed('Log out and log in to get project name')
+  const projectId = asBold(config.projectId)
+  return `You are logged in as ${email},\nSelected project: ${project} (${projectId})`
 }
 
 export function asFormattedTeam(
@@ -24,26 +24,24 @@ export function asFormattedTeam(
   const name = asBold(team.name)
   const id = asBold(team.teamID)
   const isSelected =
-    team.teamID == selected ? asPrimary(' (currently selected team)') : ''
+    team.teamID == selected ? asPrimary(' (currently selected project)') : ''
   return `${name} (${id})${isSelected}`
 }
 
-export function asFormattedSandboxTemplate(
-  template: Pick<e2b.components['schemas']['Template'], 'templateID'> & {
-    aliases?: e2b.components['schemas']['Template']['aliases']
-  },
-  configLocalPath?: string
-) {
+export type SandboxTemplateRef = Pick<
+  e2b.components['schemas']['Template'],
+  'templateID'
+> & {
+  aliases?: e2b.components['schemas']['Template']['aliases']
+}
+
+export function asFormattedSandboxTemplate(template: SandboxTemplateRef) {
   const aliases = listAliases(template.aliases)
 
   const name = aliases ? asBold(aliases) : ''
-  const configPath = configLocalPath
-    ? asDim(' <-> ') + asLocalRelative(configLocalPath)
-    : ''
-
   const id = `${template.templateID} `
 
-  return `${id}${name}${configPath}`.trim()
+  return `${id}${name}`.trim()
 }
 
 export function asRed(text: string) {
